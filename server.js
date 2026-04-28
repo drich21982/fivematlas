@@ -47,6 +47,7 @@ function cleanDomain(input = "") {
 
 function cleanText(value = "") {
   return String(value)
+    .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .replace(/\u00a0/g, " ")
     .trim();
@@ -80,7 +81,7 @@ function guessTags(text = "") {
     sasp: ["sasp", "state police"],
     sahp: ["sahp", "highway patrol"],
     lspd: ["lspd", "police"],
-    leo: ["leo", "law enforcement"],
+    leo: ["leo", "law enforcement", "police", "sheriff"],
     eup: ["eup", "uniform"],
     livery: ["livery", "liveries"],
     vehicle: ["vehicle", "vehicles", "car", "truck", "suv", "cvpi", "charger", "tahoe", "explorer"],
@@ -96,9 +97,7 @@ function guessTags(text = "") {
   };
 
   for (const [tag, words] of Object.entries(map)) {
-    if (words.some(word => value.includes(word))) {
-      tags.push(tag);
-    }
+    if (words.some(word => value.includes(word))) tags.push(tag);
   }
 
   return [...new Set(tags)];
@@ -117,28 +116,33 @@ async function fetchHtml(url) {
     }
   });
 
-  if (!response.ok) {
-    throw new Error(`Fetch failed with status ${response.status}`);
-  }
-
+  if (!response.ok) throw new Error(`Fetch failed with status ${response.status}`);
   return response.text();
 }
 
-function extractProductLinks(html, pageUrl, sourceDomain) {
+async function fetchJson(url) {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "FiveMAtlasIndexer/1.0 (+https://fivematlas.com)",
+      Accept: "application/json,text/plain,*/*"
+    }
+  });
+
+  if (!response.ok) throw new Error(`JSON fetch failed with status ${response.status}`);
+  return response.json();
+}
+
+function extractProductLinks(html, pageUrl) {
   const $ = cheerio.load(html);
   const links = new Set();
 
-  $('a[href*="/products/"]').each((_, el) => {
+  $("a").each((_, el) => {
     const href = $(el).attr("href");
     if (!href) return;
 
     const fullUrl = normalizeUrl(href, pageUrl);
     if (!fullUrl) return;
-
-    const parsed = new URL(fullUrl);
-    if (!cleanDomain(parsed.hostname).includes(cleanDomain(sourceDomain))) return;
-
-    if (!parsed.pathname.includes("/products/")) return;
+    if (!fullUrl.includes("/products/")) return;
 
     links.add(stripUrlNoise(fullUrl));
   });
@@ -158,21 +162,15 @@ function parseJsonLdProduct($) {
       const items = Array.isArray(data) ? data : [data];
 
       for (const item of items) {
-        if (item["@type"] === "Product") {
-          products.push(item);
-        }
+        if (item["@type"] === "Product") products.push(item);
 
         if (Array.isArray(item["@graph"])) {
           for (const graphItem of item["@graph"]) {
-            if (graphItem["@type"] === "Product") {
-              products.push(graphItem);
-            }
+            if (graphItem["@type"] === "Product") products.push(graphItem);
           }
         }
       }
-    } catch {
-      // ignore bad JSON-LD
-    }
+    } catch {}
   });
 
   return products[0] || null;
@@ -193,7 +191,7 @@ function parseProductPage(html, productUrl, source) {
     .replace(/\s*[–|-]\s*RedneckMods\s*$/i, "")
     .trim();
 
-  let description =
+  const description =
     cleanText(jsonLd?.description) ||
     cleanText($('meta[name="description"]').attr("content")) ||
     cleanText($('meta[property="og:description"]').attr("content")) ||
@@ -238,6 +236,50 @@ function parseProductPage(html, productUrl, source) {
     image_url: imageUrl,
     tags
   };
+}
+
+async function getShopifyProducts(source, baseUrl, limit = 250) {
+  const products = [];
+
+  for (let page = 1; page <= 10; page++) {
+    const apiUrl = `${baseUrl}/products.json?limit=250&page=${page}`;
+
+    try {
+      const data = await fetchJson(apiUrl);
+      const batch = data.products || [];
+
+      if (!batch.length) break;
+
+      for (const p of batch) {
+        const title = cleanText(p.title);
+        const description = cleanText(p.body_html || "");
+        const url = `${baseUrl}/products/${p.handle}`;
+        const price = p.variants?.[0]?.price || null;
+        const imageUrl = p.images?.[0]?.src || null;
+        const tags = guessTags(`${title} ${description} ${url}`);
+
+        products.push({
+          source_id: source.id,
+          source_name: source.name,
+          source_domain: source.domain,
+          title,
+          url,
+          description,
+          category: tags[0] || "external",
+          price,
+          image_url: imageUrl,
+          tags
+        });
+
+        if (products.length >= Number(limit)) return products;
+      }
+    } catch (err) {
+      console.warn("Shopify fallback failed:", err.message);
+      break;
+    }
+  }
+
+  return products;
 }
 
 async function initDatabase() {
@@ -448,10 +490,11 @@ app.post("/api/indexer/source/:id", requireAdmin, async (req, res) => {
     const crawlPages = [
       start_url || `${baseUrl}/collections/all`,
       `${baseUrl}/collections/all`,
+      `${baseUrl}/collections/all?sort_by=best-selling`,
       `${baseUrl}/collections/vehicles`,
       `${baseUrl}/collections/sirens`,
-      `${baseUrl}/collections/law-enforcement-packs`,
       `${baseUrl}/collections/fire-ems`,
+      `${baseUrl}/collections/law-enforcement-packs`,
       `${baseUrl}/collections/dot-civilian-packs`,
       baseUrl
     ];
@@ -467,7 +510,9 @@ app.post("/api/indexer/source/:id", requireAdmin, async (req, res) => {
 
         try {
           const html = await fetchHtml(pageUrl);
-          const links = extractProductLinks(html, pageUrl, source.domain);
+          const links = extractProductLinks(html, pageUrl);
+
+          console.log(`Indexer page checked: ${pageUrl} | product links found: ${links.length}`);
 
           if (!links.length && page > 1) break;
 
@@ -475,11 +520,7 @@ app.post("/api/indexer/source/:id", requireAdmin, async (req, res) => {
 
           if (productLinks.size >= Number(limit)) break;
         } catch (err) {
-          pageErrors.push({
-            url: pageUrl,
-            error: err.message
-          });
-
+          pageErrors.push({ url: pageUrl, error: err.message });
           if (page === 1) break;
         }
       }
@@ -487,22 +528,30 @@ app.post("/api/indexer/source/:id", requireAdmin, async (req, res) => {
       if (productLinks.size >= Number(limit)) break;
     }
 
+    let products = [];
     const linksToIndex = [...productLinks].slice(0, Number(limit) || 250);
-
-    let indexed = 0;
-    let failed = 0;
-    const productErrors = [];
 
     for (const productUrl of linksToIndex) {
       try {
         const html = await fetchHtml(productUrl);
         const product = parseProductPage(html, productUrl, source);
+        if (product) products.push(product);
+      } catch {}
+    }
 
-        if (!product) {
-          failed++;
-          continue;
-        }
+    let usedFallback = false;
 
+    if (!products.length) {
+      usedFallback = true;
+      products = await getShopifyProducts(source, baseUrl, Number(limit) || 250);
+    }
+
+    let indexed = 0;
+    let failed = 0;
+    const productErrors = [];
+
+    for (const product of products) {
+      try {
         await pool.query(
           `
           INSERT INTO indexed_assets
@@ -539,7 +588,7 @@ app.post("/api/indexer/source/:id", requireAdmin, async (req, res) => {
       } catch (err) {
         failed++;
         productErrors.push({
-          url: productUrl,
+          url: product.url,
           error: err.message
         });
       }
@@ -553,9 +602,10 @@ app.post("/api/indexer/source/:id", requireAdmin, async (req, res) => {
           sourceId: source.id,
           sourceDomain: source.domain,
           baseUrl,
-          found: linksToIndex.length,
+          found: products.length,
           indexed,
           failed,
+          usedFallback,
           pageErrors: pageErrors.slice(0, 10),
           productErrors: productErrors.slice(0, 10)
         }
@@ -566,9 +616,10 @@ app.post("/api/indexer/source/:id", requireAdmin, async (req, res) => {
       success: true,
       message: "Source indexed.",
       source: source.domain,
-      found: linksToIndex.length,
+      found: products.length,
       indexed,
       failed,
+      usedFallback,
       pageErrors: pageErrors.slice(0, 10),
       productErrors: productErrors.slice(0, 10)
     });
