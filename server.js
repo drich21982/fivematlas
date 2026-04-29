@@ -6,6 +6,7 @@ const cheerio = require("cheerio");
 
 const sourceRoutes = require("./routes/sources");
 const partnersRoutes = require("./routes/partners");
+const indexerRoutes = require("./routes/indexer");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -431,6 +432,7 @@ app.post("/admin/logout", requireAdmin, (req, res) => {
 
 app.use("/api/sources", sourceRoutes(pool, requireAdmin));
 app.use("/api", partnersRoutes(pool, requireAdmin));
+app.use("/api/indexer", indexerRoutes(pool, requireAdmin));
 
 // ===== INIT PARTNERS TABLE (ONE-TIME SETUP ROUTE) =====
 app.get("/init-partners-table", async (req, res) => {
