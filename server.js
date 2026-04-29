@@ -1031,6 +1031,45 @@ app.use((req, res) => {
 
 initDatabase()
   .then(() => {
+    app.get('/init-partners-table', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS partners (
+          id SERIAL PRIMARY KEY,
+          name TEXT NOT NULL,
+          logo_url TEXT,
+          type TEXT,
+          category TEXT,
+          short_description TEXT,
+          full_description TEXT,
+          features JSONB DEFAULT '[]'::jsonb,
+          departments JSONB DEFAULT '[]'::jsonb,
+          tags JSONB DEFAULT '[]'::jsonb,
+          member_count INTEGER DEFAULT 0,
+          recruitment_status TEXT,
+          discord_url TEXT,
+          website_url TEXT,
+          owner_name TEXT,
+          is_verified BOOLEAN DEFAULT false,
+          is_featured BOOLEAN DEFAULT false,
+          display_order INTEGER DEFAULT 0,
+          status TEXT DEFAULT 'active',
+          created_at TIMESTAMP DEFAULT NOW(),
+          updated_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_partners_status ON partners(status);
+      CREATE INDEX IF NOT EXISTS idx_partners_type ON partners(type);
+      CREATE INDEX IF NOT EXISTS idx_partners_category ON partners(category);
+      CREATE INDEX IF NOT EXISTS idx_partners_verified ON partners(is_verified);
+    `);
+
+    res.json({ success: true, message: 'Partners table created' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`FiveM Atlas Backend running on port ${PORT}`);
     });
