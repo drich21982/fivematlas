@@ -5,6 +5,7 @@ const { Pool } = require("pg");
 const cheerio = require("cheerio");
 
 const sourceRoutes = require("./routes/sources");
+const partnersRoutes = require("./routes/partners");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,35 +22,6 @@ const pool = new Pool({
 });
 
 const sessions = new Set();
-
-const USER_SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
-function nowPlusUserTtl() { return new Date(Date.now() + USER_SESSION_TTL_MS); }
-function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
-  const hash = crypto.pbkdf2Sync(String(password), salt, 120000, 64, "sha512").toString("hex");
-  return `${salt}:${hash}`;
-}
-function verifyPassword(password, stored = "") {
-  const [salt, originalHash] = String(stored).split(":");
-  if (!salt || !originalHash) return false;
-  const testHash = crypto.pbkdf2Sync(String(password), salt, 120000, 64, "sha512").toString("hex");
-  return crypto.timingSafeEqual(Buffer.from(originalHash, "hex"), Buffer.from(testHash, "hex"));
-}
-function publicUser(row) {
-  if (!row) return null;
-  return { id: row.id, username: row.username, email: row.email, avatarUrl: row.avatar_url || "", bio: row.bio || "", website: row.website || "", discord: row.discord || "", role: row.role || "user", createdAt: row.created_at };
-}
-async function requireUser(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token = auth.replace("Bearer ", "").trim();
-  if (!token) return res.status(401).json({ success: false, message: "Unauthorized user request." });
-  try {
-    const result = await pool.query(`SELECT u.* FROM user_sessions s JOIN users u ON u.id = s.user_id WHERE s.token = $1 AND s.expires_at > NOW();`, [token]);
-    if (!result.rows.length) return res.status(401).json({ success: false, message: "User session expired or invalid." });
-    req.user = result.rows[0];
-    req.userToken = token;
-    next();
-  } catch (err) { res.status(500).json({ success: false, message: "User auth failed.", error: err.message }); }
-}
 
 function requireAdmin(req, res, next) {
   const auth = req.headers.authorization || "";
@@ -410,17 +382,6 @@ async function initDatabase() {
 
   await pool.query(`ALTER TABLE indexed_assets ADD COLUMN IF NOT EXISTS image_url TEXT;`);
 
-  await pool.query(`ALTER TABLE assets ADD COLUMN IF NOT EXISTS image_url TEXT;`);
-  await pool.query(`ALTER TABLE assets ADD COLUMN IF NOT EXISTS clicks INTEGER DEFAULT 0;`);
-  await pool.query(`ALTER TABLE indexed_assets ADD COLUMN IF NOT EXISTS clicks INTEGER DEFAULT 0;`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT NOT NULL UNIQUE, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, avatar_url TEXT, bio TEXT, website TEXT, discord TEXT, role TEXT DEFAULT 'user', created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW());`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS user_sessions (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, token TEXT NOT NULL UNIQUE, expires_at TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT NOW());`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS favorites (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, asset_source TEXT NOT NULL, asset_id INTEGER NOT NULL, title TEXT, url TEXT, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(user_id, asset_source, asset_id));`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS collections (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, description TEXT, visibility TEXT DEFAULT 'private', created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW());`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS collection_items (id SERIAL PRIMARY KEY, collection_id INTEGER REFERENCES collections(id) ON DELETE CASCADE, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, asset_source TEXT NOT NULL, asset_id INTEGER NOT NULL, title TEXT, url TEXT, created_at TIMESTAMP DEFAULT NOW(), UNIQUE(collection_id, asset_source, asset_id));`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS click_logs (id SERIAL PRIMARY KEY, asset_source TEXT NOT NULL, asset_id INTEGER NOT NULL, title TEXT, url TEXT, query TEXT, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, created_at TIMESTAMP DEFAULT NOW());`);
-
-
   console.log("Database tables ready.");
 }
 
@@ -469,6 +430,7 @@ app.post("/admin/logout", requireAdmin, (req, res) => {
 });
 
 app.use("/api/sources", sourceRoutes(pool, requireAdmin));
+app.use("/api", partnersRoutes(pool, requireAdmin));
 
 app.get("/api/indexer/test", (req, res) => {
   res.json({
@@ -1038,85 +1000,6 @@ app.post("/admin/reject/:id", requireAdmin, async (req, res) => {
       error: err.message
     });
   }
-});
-
-
-app.post("/track-click", async (req, res) => {
-  const { assetSource, assetId, title, url, query } = req.body || {};
-  const auth = req.headers.authorization || "";
-  const token = auth.replace("Bearer ", "").trim();
-  let userId = null;
-  if (!assetSource || !assetId || !url) return res.status(400).json({ success: false, message: "assetSource, assetId, and url are required." });
-  try {
-    if (token) {
-      const userResult = await pool.query("SELECT user_id FROM user_sessions WHERE token = $1 AND expires_at > NOW()", [token]);
-      userId = userResult.rows[0]?.user_id || null;
-    }
-    await pool.query(`INSERT INTO click_logs (asset_source, asset_id, title, url, query, user_id) VALUES ($1,$2,$3,$4,$5,$6);`, [assetSource, Number(assetId), title || "", url, query || "", userId]);
-    if (assetSource === "internal") await pool.query("UPDATE assets SET clicks = COALESCE(clicks, 0) + 1 WHERE id = $1", [Number(assetId)]);
-    else await pool.query("UPDATE indexed_assets SET clicks = COALESCE(clicks, 0) + 1 WHERE id = $1", [Number(assetId)]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ success: false, message: "Click tracking failed.", error: err.message }); }
-});
-
-app.post("/auth/register", async (req, res) => {
-  const { username, email, password } = req.body || {};
-  if (!username || !email || !password) return res.status(400).json({ success: false, message: "Username, email, and password are required." });
-  if (String(password).length < 8) return res.status(400).json({ success: false, message: "Password must be at least 8 characters." });
-  try {
-    const result = await pool.query(`INSERT INTO users (username, email, password_hash) VALUES ($1, LOWER($2), $3) RETURNING *;`, [String(username).trim(), String(email).trim(), hashPassword(password)]);
-    const token = crypto.randomBytes(40).toString("hex");
-    await pool.query("INSERT INTO user_sessions (user_id, token, expires_at) VALUES ($1,$2,$3)", [result.rows[0].id, token, nowPlusUserTtl()]);
-    res.status(201).json({ success: true, token, user: publicUser(result.rows[0]) });
-  } catch (err) { if (err.code === "23505") return res.status(409).json({ success: false, message: "That username or email is already registered." }); res.status(500).json({ success: false, message: "Registration failed.", error: err.message }); }
-});
-
-app.post("/auth/login", async (req, res) => {
-  const { email, password } = req.body || {};
-  try {
-    const result = await pool.query("SELECT * FROM users WHERE email = LOWER($1) OR username = $1 LIMIT 1", [String(email || "").trim()]);
-    const user = result.rows[0];
-    if (!user || !verifyPassword(password || "", user.password_hash)) return res.status(401).json({ success: false, message: "Invalid login." });
-    const token = crypto.randomBytes(40).toString("hex");
-    await pool.query("INSERT INTO user_sessions (user_id, token, expires_at) VALUES ($1,$2,$3)", [user.id, token, nowPlusUserTtl()]);
-    res.json({ success: true, token, user: publicUser(user) });
-  } catch (err) { res.status(500).json({ success: false, message: "Login failed.", error: err.message }); }
-});
-
-app.post("/auth/logout", requireUser, async (req, res) => { await pool.query("DELETE FROM user_sessions WHERE token = $1", [req.userToken]); res.json({ success: true }); });
-app.get("/me", requireUser, async (req, res) => { res.json({ success: true, user: publicUser(req.user) }); });
-
-app.patch("/me", requireUser, async (req, res) => {
-  const { username, avatarUrl, bio, website, discord } = req.body || {};
-  try {
-    const result = await pool.query(`UPDATE users SET username = COALESCE(NULLIF($1, ''), username), avatar_url = $2, bio = $3, website = $4, discord = $5, updated_at = NOW() WHERE id = $6 RETURNING *;`, [username || req.user.username, avatarUrl || "", bio || "", website || "", discord || "", req.user.id]);
-    res.json({ success: true, user: publicUser(result.rows[0]) });
-  } catch (err) { if (err.code === "23505") return res.status(409).json({ success: false, message: "That username is already taken." }); res.status(500).json({ success: false, message: "Profile update failed.", error: err.message }); }
-});
-
-app.get("/favorites", requireUser, async (req, res) => { const result = await pool.query("SELECT * FROM favorites WHERE user_id = $1 ORDER BY created_at DESC", [req.user.id]); res.json({ success: true, favorites: result.rows }); });
-
-app.post("/favorites", requireUser, async (req, res) => {
-  const { assetSource, assetId, title, url } = req.body || {};
-  if (!assetSource || !assetId) return res.status(400).json({ success: false, message: "assetSource and assetId are required." });
-  const result = await pool.query(`INSERT INTO favorites (user_id, asset_source, asset_id, title, url) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (user_id, asset_source, asset_id) DO UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url RETURNING *;`, [req.user.id, assetSource, Number(assetId), title || "", url || ""]);
-  res.json({ success: true, favorite: result.rows[0] });
-});
-
-app.delete("/favorites/:source/:id", requireUser, async (req, res) => { await pool.query("DELETE FROM favorites WHERE user_id = $1 AND asset_source = $2 AND asset_id = $3", [req.user.id, req.params.source, Number(req.params.id)]); res.json({ success: true }); });
-
-app.get("/collections", requireUser, async (req, res) => { const collections = await pool.query("SELECT * FROM collections WHERE user_id = $1 ORDER BY updated_at DESC", [req.user.id]); const items = await pool.query("SELECT * FROM collection_items WHERE user_id = $1 ORDER BY created_at DESC", [req.user.id]); res.json({ success: true, collections: collections.rows, items: items.rows }); });
-
-app.post("/collections", requireUser, async (req, res) => { const { name, description, visibility } = req.body || {}; if (!name) return res.status(400).json({ success: false, message: "Collection name is required." }); const result = await pool.query(`INSERT INTO collections (user_id, name, description, visibility) VALUES ($1,$2,$3,$4) RETURNING *;`, [req.user.id, String(name).trim(), description || "", visibility || "private"]); res.status(201).json({ success: true, collection: result.rows[0] }); });
-
-app.post("/collections/:id/items", requireUser, async (req, res) => {
-  const { assetSource, assetId, title, url } = req.body || {};
-  const collectionId = Number(req.params.id);
-  const check = await pool.query("SELECT id FROM collections WHERE id = $1 AND user_id = $2", [collectionId, req.user.id]);
-  if (!check.rows.length) return res.status(404).json({ success: false, message: "Collection not found." });
-  const result = await pool.query(`INSERT INTO collection_items (collection_id, user_id, asset_source, asset_id, title, url) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (collection_id, asset_source, asset_id) DO UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url RETURNING *;`, [collectionId, req.user.id, assetSource, Number(assetId), title || "", url || ""]);
-  await pool.query("UPDATE collections SET updated_at = NOW() WHERE id = $1", [collectionId]);
-  res.json({ success: true, item: result.rows[0] });
 });
 
 app.post("/report-broken-link", async (req, res) => {
