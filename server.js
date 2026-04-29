@@ -1065,6 +1065,41 @@ app.post("/report-broken-link", async (req, res) => {
   }
 });
 
+app.get("/api/stats", async (req, res) => {
+  try {
+    const indexedResult = await pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM indexed_assets;
+    `);
+
+    const internalResult = await pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM assets
+      WHERE status = 'approved';
+    `);
+
+    const sourcesResult = await pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM trusted_sources
+      WHERE enabled = true;
+    `);
+
+    res.json({
+      success: true,
+      indexedAssets: indexedResult.rows[0].count,
+      internalAssets: internalResult.rows[0].count,
+      totalAssets: indexedResult.rows[0].count + internalResult.rows[0].count,
+      trustedSources: sourcesResult.rows[0].count
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to load stats.",
+      error: err.message
+    });
+  }
+});
+
 app.use((req, res) => {
   res.status(404).json({
     error: "Route not found",
