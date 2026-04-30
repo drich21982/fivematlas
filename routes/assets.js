@@ -3,6 +3,61 @@ const express = require("express");
 module.exports = function (pool, requireAdmin) {
   const router = express.Router();
 
+  router.get("/", async (req, res) => {
+  try {
+    const indexed = await pool.query(`
+      SELECT
+        id,
+        'indexed' AS source_type,
+        title,
+        url,
+        description,
+        category AS type,
+        price,
+        image_url,
+        tags,
+        source_name,
+        source_domain,
+        indexed_at AS created_at
+      FROM indexed_assets
+      ORDER BY indexed_at DESC
+      LIMIT 300;
+    `);
+
+    const internal = await pool.query(`
+      SELECT
+        id,
+        'internal' AS source_type,
+        title,
+        url,
+        description,
+        type,
+        price_type AS price,
+        NULL AS image_url,
+        tags,
+        developer AS source_name,
+        NULL AS source_domain,
+        created_at
+      FROM assets
+      WHERE status = 'approved'
+      ORDER BY created_at DESC
+      LIMIT 300;
+    `);
+
+    res.json({
+      success: true,
+      count: indexed.rows.length + internal.rows.length,
+      assets: [...indexed.rows, ...internal.rows]
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to load marketplace assets.",
+      error: err.message
+    });
+  }
+});
+
   // Get single asset (indexed OR internal)
   router.get("/:source/:id", async (req, res) => {
     const { source, id } = req.params;
