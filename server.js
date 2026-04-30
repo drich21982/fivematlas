@@ -39,6 +39,53 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+function requireUserToken(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: "Login required." });
+  }
+
+  req.userToken = token;
+  req.userTokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  next();
+}
+
+function normalizeFavoriteSource(source = "") {
+  const value = String(source || "").toLowerCase().trim();
+  if (value === "internal" || value === "community") return "internal";
+  return "indexed";
+}
+
+async function ensureFavoritesSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS favorites (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      token_hash TEXT,
+      asset_source TEXT NOT NULL,
+      asset_id TEXT NOT NULL,
+      title TEXT,
+      url TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`ALTER TABLE favorites ADD COLUMN IF NOT EXISTS user_id INTEGER;`);
+  await pool.query(`ALTER TABLE favorites ADD COLUMN IF NOT EXISTS token_hash TEXT;`);
+  await pool.query(`ALTER TABLE favorites ADD COLUMN IF NOT EXISTS asset_source TEXT;`);
+  await pool.query(`ALTER TABLE favorites ADD COLUMN IF NOT EXISTS asset_id TEXT;`);
+  await pool.query(`ALTER TABLE favorites ADD COLUMN IF NOT EXISTS title TEXT;`);
+  await pool.query(`ALTER TABLE favorites ADD COLUMN IF NOT EXISTS url TEXT;`);
+  await pool.query(`ALTER TABLE favorites ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();`);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS favorites_token_asset_unique
+    ON favorites(token_hash, asset_source, asset_id);
+  `);
+}
+
 function cleanDomain(input = "") {
   return String(input)
     .replace(/^https?:\/\//, "")
@@ -366,6 +413,24 @@ async function initDatabase() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS favorites (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      token_hash TEXT,
+      asset_source TEXT NOT NULL,
+      asset_id TEXT NOT NULL,
+      title TEXT,
+      url TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS favorites_token_asset_unique
+    ON favorites(token_hash, asset_source, asset_id);
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS indexed_assets (
       id SERIAL PRIMARY KEY,
       source_id INTEGER REFERENCES trusted_sources(id) ON DELETE CASCADE,
@@ -435,6 +500,89 @@ app.use("/api/sources", sourceRoutes(pool, requireAdmin));
 app.use("/api", partnersRoutes(pool, requireAdmin));
 app.use("/api/indexer", indexerRoutes(pool, requireAdmin));
 app.use("/api/assets", assetsRoutes(pool, requireAdmin));
+
+app.get("/favorites", requireUserToken, async (req, res) => {
+  try {
+    await ensureFavoritesSchema();
+
+    const result = await pool.query(
+      `
+      SELECT id, asset_source, asset_source AS source_type, asset_id, title, url, created_at
+      FROM favorites
+      WHERE token_hash = $1
+      ORDER BY created_at DESC;
+      `,
+      [req.userTokenHash]
+    );
+
+    res.json({ success: true, count: result.rows.length, favorites: result.rows });
+  } catch (err) {
+    console.error("Favorites load error:", err);
+    res.status(500).json({ success: false, message: "Failed to load favorites.", error: err.message });
+  }
+});
+
+app.post("/favorites", requireUserToken, async (req, res) => {
+  const assetSource = normalizeFavoriteSource(req.body.assetSource || req.body.asset_source || req.body.source || req.body.sourceType);
+  const assetId = String(req.body.assetId || req.body.asset_id || req.body.id || "").trim();
+  const title = req.body.title || null;
+  const url = req.body.url || null;
+
+  if (!assetId) {
+    return res.status(400).json({ success: false, message: "Missing assetId." });
+  }
+
+  try {
+    await ensureFavoritesSchema();
+
+    const result = await pool.query(
+      `
+      INSERT INTO favorites (token_hash, asset_source, asset_id, title, url)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (token_hash, asset_source, asset_id)
+      DO UPDATE SET
+        title = COALESCE(EXCLUDED.title, favorites.title),
+        url = COALESCE(EXCLUDED.url, favorites.url)
+      RETURNING id, asset_source, asset_source AS source_type, asset_id, title, url, created_at;
+      `,
+      [req.userTokenHash, assetSource, assetId, title, url]
+    );
+
+    res.json({ success: true, message: "Favorite saved.", favorite: result.rows[0] });
+  } catch (err) {
+    console.error("Favorite save error:", err);
+    res.status(500).json({ success: false, message: "Failed to save favorite.", error: err.message });
+  }
+});
+
+app.delete("/favorites/:source/:id", requireUserToken, async (req, res) => {
+  const assetSource = normalizeFavoriteSource(req.params.source);
+  const assetId = String(req.params.id || "").trim();
+
+  if (!assetId) {
+    return res.status(400).json({ success: false, message: "Missing asset id." });
+  }
+
+  try {
+    await ensureFavoritesSchema();
+
+    const result = await pool.query(
+      `
+      DELETE FROM favorites
+      WHERE token_hash = $1
+        AND asset_source = $2
+        AND asset_id = $3
+      RETURNING id;
+      `,
+      [req.userTokenHash, assetSource, assetId]
+    );
+
+    res.json({ success: true, removed: result.rowCount > 0 });
+  } catch (err) {
+    console.error("Favorite remove error:", err);
+    res.status(500).json({ success: false, message: "Failed to remove favorite.", error: err.message });
+  }
+});
 
 // ===== INIT PARTNERS TABLE (ONE-TIME SETUP ROUTE) =====
 app.get("/init-partners-table", async (req, res) => {
