@@ -1149,6 +1149,42 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
+// ===== SIMPLE USER AUTH (TOKEN-ONLY) =====
+
+// fake user system using token only (no passwords/db yet)
+
+app.post("/auth/login", (req, res) => {
+  // create a token and return it
+  const token = crypto.randomBytes(32).toString("hex");
+
+  res.json({
+    success: true,
+    token
+  });
+});
+
+app.post("/auth/register", (req, res) => {
+  const token = crypto.randomBytes(32).toString("hex");
+
+  res.json({
+    success: true,
+    token
+  });
+});
+
+app.post("/auth/logout", (req, res) => {
+  res.json({ success: true });
+});
+
+app.get("/me", requireUserToken, (req, res) => {
+  res.json({
+    success: true,
+    user: {
+      id: req.userTokenHash,
+      name: "Atlas User"
+    }
+  });
+});
 
 // ===== FAVORITES ROUTES =====
 app.get("/favorites", requireUserToken, async (req, res) => {
