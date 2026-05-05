@@ -17,26 +17,61 @@ app.use(express.json({ limit: "2mb" }));
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "admin@test.com";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "test123";
+const FOUNDER_EMAIL = (process.env.FOUNDER_EMAIL || "dsjrich3@gmail.com").toLowerCase();
+const FOUNDER_PASSWORD = process.env.FOUNDER_PASSWORD || ADMIN_PASSWORD;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-const sessions = new Set();
+const sessions = new Map();
 
 function requireAdmin(req, res, next) {
   const auth = req.headers.authorization || "";
-  const token = auth.replace("Bearer ", "");
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+  const session = token ? sessions.get(token) : null;
 
-  if (!token || !sessions.has(token)) {
+  if (!session || (session.role !== "admin" && session.role !== "founder")) {
     return res.status(401).json({
       success: false,
       message: "Unauthorized admin request."
     });
   }
 
+  req.admin = session;
+  req.adminToken = token;
   next();
+}
+
+function requireFounder(req, res, next) {
+  if (!req.admin || req.admin.role !== "founder") {
+    return res.status(403).json({ success: false, message: "Founder access required." });
+  }
+  next();
+}
+
+function hashPassword(password = "") {
+  return crypto.createHash("sha256").update(String(password)).digest("hex");
+}
+
+function normalizeEmail(email = "") {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isFounderEmail(email = "") {
+  return normalizeEmail(email) === FOUNDER_EMAIL;
+}
+
+async function writeAdminLog(action, details = {}, admin = null) {
+  try {
+    await pool.query(
+      "INSERT INTO admin_logs (admin_email, admin_role, action, details) VALUES ($1,$2,$3,$4)",
+      [admin?.email || null, admin?.role || null, action, details]
+    );
+  } catch (err) {
+    console.warn("Admin log failed:", err.message);
+  }
 }
 
 function requireUserToken(req, res, next) {
@@ -430,6 +465,131 @@ async function initDatabase() {
   `);
 
   await pool.query(`ALTER TABLE indexed_assets ADD COLUMN IF NOT EXISTS image_url TEXT;`);
+  await pool.query(`ALTER TABLE indexed_assets ADD COLUMN IF NOT EXISTS clicks INTEGER DEFAULT 0;`);
+  await pool.query(`ALTER TABLE assets ADD COLUMN IF NOT EXISTS clicks INTEGER DEFAULT 0;`);
+  await pool.query(`ALTER TABLE assets ADD COLUMN IF NOT EXISTS image_url TEXT;`);
+
+
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email TEXT UNIQUE,
+      username TEXT,
+      password_hash TEXT,
+      role TEXT DEFAULT 'user',
+      is_banned BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT NOW(),
+      last_login_at TIMESTAMP
+    );
+  `);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user';`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_logs (
+      id SERIAL PRIMARY KEY,
+      admin_email TEXT,
+      admin_role TEXT,
+      action TEXT NOT NULL,
+      details JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS site_settings (
+      key TEXT PRIMARY KEY,
+      value JSONB DEFAULT '{}'::jsonb,
+      updated_by TEXT,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS announcements (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      type TEXT DEFAULT 'info',
+      scope TEXT DEFAULT 'all',
+      enabled BOOLEAN DEFAULT true,
+      starts_at TIMESTAMP,
+      ends_at TIMESTAMP,
+      created_by TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS feature_toggles (
+      key TEXT PRIMARY KEY,
+      value BOOLEAN DEFAULT true,
+      description TEXT,
+      updated_by TEXT,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tool_analytics (
+      id SERIAL PRIMARY KEY,
+      tool TEXT NOT NULL,
+      event TEXT NOT NULL,
+      user_id TEXT,
+      metadata JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS developers (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      display_name TEXT NOT NULL,
+      bio TEXT,
+      avatar_url TEXT,
+      verified BOOLEAN DEFAULT false,
+      suspended BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`ALTER TABLE developers ADD COLUMN IF NOT EXISTS user_id INTEGER;`);
+  await pool.query(`ALTER TABLE developers ADD COLUMN IF NOT EXISTS display_name TEXT;`);
+  await pool.query(`ALTER TABLE developers ADD COLUMN IF NOT EXISTS bio TEXT;`);
+  await pool.query(`ALTER TABLE developers ADD COLUMN IF NOT EXISTS avatar_url TEXT;`);
+  await pool.query(`ALTER TABLE developers ADD COLUMN IF NOT EXISTS verified BOOLEAN DEFAULT false;`);
+  await pool.query(`ALTER TABLE developers ADD COLUMN IF NOT EXISTS suspended BOOLEAN DEFAULT false;`);
+  await pool.query(`ALTER TABLE developers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();`);
+
+  await pool.query(`
+    INSERT INTO feature_toggles (key, value, description)
+    VALUES
+      ('marketplace', true, 'Marketplace pages and asset browsing'),
+      ('submissions', true, 'Public asset submissions'),
+      ('tools', true, 'FiveM Atlas tools hub'),
+      ('workspace', true, 'Tool workspace and local project hub'),
+      ('developer_profiles', true, 'Developer profile pages'),
+      ('favorites', true, 'User favorites system'),
+      ('indexer', true, 'Trusted source indexing'),
+      ('beta_tools', true, 'Experimental and advanced tools'),
+      ('maintenance_mode', false, 'Founder-only maintenance mode')
+    ON CONFLICT (key) DO NOTHING;
+  `);
+
+  await pool.query(
+    `INSERT INTO users (email, username, password_hash, role)
+     VALUES ($1, $2, $3, 'founder')
+     ON CONFLICT (email) DO UPDATE SET role = 'founder', password_hash = COALESCE(users.password_hash, EXCLUDED.password_hash);`,
+    [FOUNDER_EMAIL, 'DSJ Rich', hashPassword(FOUNDER_PASSWORD)]
+  );
 
   console.log("Database tables ready.");
 }
@@ -451,24 +611,41 @@ app.get("/health", async (req, res) => {
   }
 });
 
-app.post("/admin/login", (req, res) => {
-  const { email, password } = req.body;
+app.post("/admin/login", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const password = String(req.body.password || "");
 
-  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
-    return res.status(401).json({
-      success: false,
-      message: "Invalid admin login."
-    });
+  try {
+    let adminUser = null;
+
+    if (email === normalizeEmail(ADMIN_EMAIL) && password === ADMIN_PASSWORD) {
+      adminUser = { id: 0, email, role: isFounderEmail(email) ? "founder" : "admin", username: "Environment Admin" };
+    }
+
+    if (!adminUser) {
+      const result = await pool.query("SELECT * FROM users WHERE lower(email) = lower($1) LIMIT 1", [email]);
+      const user = result.rows[0];
+      const passwordOk = user?.password_hash && user.password_hash === hashPassword(password);
+      const founderPasswordOk = isFounderEmail(email) && (password === FOUNDER_PASSWORD || password === ADMIN_PASSWORD);
+
+      if (user && !user.is_banned && (user.role === "admin" || user.role === "founder" || isFounderEmail(user.email)) && (passwordOk || founderPasswordOk)) {
+        adminUser = { id: user.id, email: user.email, role: isFounderEmail(user.email) ? "founder" : user.role, username: user.username || user.email };
+        await pool.query("UPDATE users SET last_login_at = NOW(), role = CASE WHEN lower(email)=lower($2) THEN 'founder' ELSE role END WHERE id = $1", [user.id, FOUNDER_EMAIL]);
+      }
+    }
+
+    if (!adminUser) {
+      return res.status(401).json({ success: false, message: "Invalid admin login or account is not an admin." });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    sessions.set(token, adminUser);
+    await writeAdminLog("admin_login", { email: adminUser.email }, adminUser);
+
+    res.json({ success: true, message: "Login successful", token, user: adminUser, isFounder: adminUser.role === "founder" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Admin login failed.", error: err.message });
   }
-
-  const token = crypto.randomBytes(32).toString("hex");
-  sessions.add(token);
-
-  res.json({
-    success: true,
-    message: "Login successful",
-    token
-  });
 });
 
 app.post("/admin/logout", requireAdmin, (req, res) => {
@@ -476,6 +653,61 @@ app.post("/admin/logout", requireAdmin, (req, res) => {
   const token = auth.replace("Bearer ", "");
   sessions.delete(token);
   res.json({ success: true });
+});
+
+
+app.get("/admin/me", requireAdmin, (req, res) => {
+  res.json({ success: true, user: req.admin, isFounder: req.admin.role === "founder" });
+});
+
+app.get("/api/public/settings", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT key, value FROM site_settings WHERE key IN ('favicon','global_pfp','site_title')");
+    const settings = {};
+    for (const row of result.rows) settings[row.key] = row.value;
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.json({ success: true, settings: {} });
+  }
+});
+
+app.get("/api/public/announcements", async (req, res) => {
+  try {
+    const scope = String(req.query.scope || "all").toLowerCase();
+    const result = await pool.query(
+      `SELECT * FROM announcements
+       WHERE enabled = true
+         AND (scope = 'all' OR scope = $1)
+         AND (starts_at IS NULL OR starts_at <= NOW())
+         AND (ends_at IS NULL OR ends_at >= NOW())
+       ORDER BY created_at DESC
+       LIMIT 5`,
+      [scope]
+    );
+    res.json({ success: true, announcements: result.rows });
+  } catch (err) {
+    res.json({ success: true, announcements: [] });
+  }
+});
+
+app.get("/api/public/features", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT key, value FROM feature_toggles");
+    res.json({ success: true, features: Object.fromEntries(result.rows.map(r => [r.key, r.value])) });
+  } catch (err) {
+    res.json({ success: true, features: {} });
+  }
+});
+
+app.post("/api/tools/track", async (req, res) => {
+  try {
+    const { tool, event = "open", userId = null, metadata = {} } = req.body || {};
+    if (!tool) return res.status(400).json({ success: false, message: "Missing tool." });
+    await pool.query("INSERT INTO tool_analytics (tool, event, user_id, metadata) VALUES ($1,$2,$3,$4)", [String(tool), String(event), userId, metadata]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Tool tracking failed.", error: err.message });
+  }
 });
 
 app.use("/api/sources", sourceRoutes(pool, requireAdmin));
@@ -896,6 +1128,19 @@ app.get("/search", async (req, res) => {
   }
 });
 
+app.post("/track-click", async (req, res) => {
+  try {
+    const source = normalizeFavoriteSource(req.body.source || req.body.sourceType || req.body.assetSource);
+    const id = Number(req.body.id || req.body.assetId);
+    if (!id) return res.json({ success: true, tracked: false });
+    if (source === "internal") await pool.query("UPDATE assets SET clicks = COALESCE(clicks,0)+1 WHERE id=$1", [id]);
+    else await pool.query("UPDATE indexed_assets SET clicks = COALESCE(clicks,0)+1 WHERE id=$1", [id]);
+    res.json({ success: true, tracked: true });
+  } catch (err) {
+    res.json({ success: true, tracked: false });
+  }
+});
+
 app.post("/submit-asset", async (req, res) => {
   const {
     title,
@@ -1149,27 +1394,147 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
-// ===== SIMPLE USER AUTH (TOKEN-ONLY) =====
 
-// fake user system using token only (no passwords/db yet)
-
-app.post("/auth/login", (req, res) => {
-  // create a token and return it
-  const token = crypto.randomBytes(32).toString("hex");
-
-  res.json({
-    success: true,
-    token
-  });
+// ===== ADVANCED ADMIN / FOUNDER ROUTES =====
+app.get("/admin/platform-analytics", requireAdmin, async (req, res) => {
+  try {
+    const q = async (sql) => (await pool.query(sql)).rows[0] || {};
+    const [users, assets, indexed, submissions, favorites, searches, sources, blacklisted, announcements, developers] = await Promise.all([
+      q("SELECT COUNT(*)::int AS count FROM users"),
+      q("SELECT COUNT(*)::int AS count FROM assets"),
+      q("SELECT COUNT(*)::int AS count FROM indexed_assets"),
+      q("SELECT COUNT(*)::int AS count FROM submissions WHERE status='pending'"),
+      q("SELECT COUNT(*)::int AS count FROM favorites"),
+      q("SELECT COUNT(*)::int AS count FROM search_logs"),
+      q("SELECT COUNT(*)::int AS count FROM trusted_sources WHERE enabled=true"),
+      q("SELECT COUNT(*)::int AS count FROM blacklisted_domains"),
+      q("SELECT COUNT(*)::int AS count FROM announcements"),
+      q("SELECT COUNT(*)::int AS count FROM developers")
+    ]);
+    const topSearches = await pool.query("SELECT query, COUNT(*)::int AS count FROM search_logs GROUP BY query ORDER BY count DESC LIMIT 10");
+    const topTools = await pool.query("SELECT tool, event, COUNT(*)::int AS count FROM tool_analytics GROUP BY tool, event ORDER BY count DESC LIMIT 20");
+    res.json({ success: true, counts: { users: users.count || 0, assets: assets.count || 0, indexedAssets: indexed.count || 0, pendingSubmissions: submissions.count || 0, favorites: favorites.count || 0, searches: searches.count || 0, trustedSources: sources.count || 0, blacklistedDomains: blacklisted.count || 0, announcements: announcements.count || 0, developers: developers.count || 0 }, topSearches: topSearches.rows, topTools: topTools.rows, founder: req.admin.role === "founder" });
+  } catch (err) { res.status(500).json({ success:false, message:"Analytics failed.", error:err.message }); }
 });
 
-app.post("/auth/register", (req, res) => {
-  const token = crypto.randomBytes(32).toString("hex");
+app.get("/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const q = `%${String(req.query.q || "").trim()}%`;
+    const result = await pool.query(`SELECT id,email,username,role,is_banned,created_at,last_login_at FROM users WHERE email ILIKE $1 OR username ILIKE $1 ORDER BY created_at DESC LIMIT 100`, [q]);
+    res.json({ success:true, users: result.rows });
+  } catch (err) { res.status(500).json({ success:false, message:"User search failed.", error:err.message }); }
+});
 
-  res.json({
-    success: true,
-    token
-  });
+app.post("/admin/users/promote", requireAdmin, requireFounder, async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  if (!email) return res.status(400).json({ success:false, message:"Email is required." });
+  try {
+    const result = await pool.query(`UPDATE users SET role='admin' WHERE lower(email)=lower($1) AND lower(email) <> lower($2) RETURNING id,email,username,role,is_banned,created_at,last_login_at`, [email, FOUNDER_EMAIL]);
+    if (!result.rows.length) return res.status(404).json({ success:false, message:"No normal account exists with that email yet. Have them create a regular account first, then promote them here." });
+    await writeAdminLog("promote_user_admin", { email }, req.admin);
+    res.json({ success:true, user: result.rows[0] });
+  } catch (err) { res.status(500).json({ success:false, message:"Promote failed.", error:err.message }); }
+});
+
+app.post("/admin/users/:id/role", requireAdmin, requireFounder, async (req, res) => {
+  const role = String(req.body.role || "user");
+  if (!["user","developer","admin"].includes(role)) return res.status(400).json({ success:false, message:"Invalid role." });
+  try {
+    const result = await pool.query(`UPDATE users SET role=$1 WHERE id=$2 AND lower(email) <> lower($3) RETURNING id,email,username,role,is_banned`, [role, req.params.id, FOUNDER_EMAIL]);
+    await writeAdminLog("set_user_role", { id:req.params.id, role }, req.admin);
+    res.json({ success:true, user: result.rows[0] || null });
+  } catch (err) { res.status(500).json({ success:false, message:"Role update failed.", error:err.message }); }
+});
+
+app.post("/admin/users/:id/ban", requireAdmin, async (req, res) => {
+  try {
+    const banned = Boolean(req.body.banned);
+    const result = await pool.query(`UPDATE users SET is_banned=$1 WHERE id=$2 AND lower(email) <> lower($3) RETURNING id,email,username,role,is_banned`, [banned, req.params.id, FOUNDER_EMAIL]);
+    await writeAdminLog(banned ? "ban_user" : "unban_user", { id:req.params.id }, req.admin);
+    res.json({ success:true, user: result.rows[0] || null });
+  } catch (err) { res.status(500).json({ success:false, message:"Ban update failed.", error:err.message }); }
+});
+
+app.get("/admin/developers", requireAdmin, async (req, res) => {
+  try {
+    const q = `%${String(req.query.q || "").trim()}%`;
+    const result = await pool.query(`SELECT d.*, u.email FROM developers d LEFT JOIN users u ON u.id=d.user_id WHERE d.display_name ILIKE $1 OR COALESCE(u.email,'') ILIKE $1 ORDER BY d.updated_at DESC, d.created_at DESC LIMIT 100`, [q]);
+    res.json({ success:true, developers: result.rows });
+  } catch (err) { res.status(500).json({ success:false, message:"Developers load failed.", error:err.message }); }
+});
+
+app.post("/admin/developers", requireAdmin, async (req,res)=>{
+  try {
+    const b=req.body||{};
+    const result=await pool.query(`INSERT INTO developers (display_name,bio,avatar_url,verified,suspended) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [b.display_name||b.name, b.bio||'', b.avatar_url||'', !!b.verified, !!b.suspended]);
+    await writeAdminLog("create_developer", result.rows[0], req.admin);
+    res.json({success:true, developer:result.rows[0]});
+  } catch(err){res.status(500).json({success:false,message:"Developer create failed.",error:err.message});}
+});
+
+app.patch("/admin/developers/:id", requireAdmin, async (req,res)=>{
+  try {
+    const b=req.body||{};
+    const result=await pool.query(`UPDATE developers SET display_name=COALESCE($1,display_name), bio=COALESCE($2,bio), avatar_url=COALESCE($3,avatar_url), verified=COALESCE($4,verified), suspended=COALESCE($5,suspended), updated_at=NOW() WHERE id=$6 RETURNING *`, [b.display_name??null,b.bio??null,b.avatar_url??null,b.verified??null,b.suspended??null,req.params.id]);
+    await writeAdminLog("update_developer", {id:req.params.id, changes:b}, req.admin);
+    res.json({success:true, developer:result.rows[0]||null});
+  } catch(err){res.status(500).json({success:false,message:"Developer update failed.",error:err.message});}
+});
+
+app.get("/admin/announcements", requireAdmin, async (req,res)=>{
+  try { const result=await pool.query("SELECT * FROM announcements ORDER BY created_at DESC LIMIT 100"); res.json({success:true, announcements:result.rows}); } catch(err){res.status(500).json({success:false,message:"Announcements failed.",error:err.message});}
+});
+app.post("/admin/announcements", requireAdmin, async (req,res)=>{
+  try { const b=req.body||{}; const result=await pool.query(`INSERT INTO announcements (title,message,type,scope,enabled,starts_at,ends_at,created_by) VALUES ($1,$2,$3,$4,$5,NULLIF($6,'')::timestamp,NULLIF($7,'')::timestamp,$8) RETURNING *`, [b.title,b.message,b.type||'info',b.scope||'all',b.enabled!==false,b.starts_at||'',b.ends_at||'',req.admin.email]); await writeAdminLog("create_announcement", result.rows[0], req.admin); res.json({success:true, announcement:result.rows[0]}); } catch(err){res.status(500).json({success:false,message:"Announcement create failed.",error:err.message});}
+});
+app.patch("/admin/announcements/:id", requireAdmin, async (req,res)=>{
+  try { const b=req.body||{}; const result=await pool.query(`UPDATE announcements SET title=COALESCE($1,title), message=COALESCE($2,message), type=COALESCE($3,type), scope=COALESCE($4,scope), enabled=COALESCE($5,enabled), starts_at=NULLIF(COALESCE($6, starts_at::text),'')::timestamp, ends_at=NULLIF(COALESCE($7, ends_at::text),'')::timestamp, updated_at=NOW() WHERE id=$8 RETURNING *`, [b.title??null,b.message??null,b.type??null,b.scope??null,b.enabled??null,b.starts_at??null,b.ends_at??null,req.params.id]); await writeAdminLog("update_announcement", {id:req.params.id, changes:b}, req.admin); res.json({success:true, announcement:result.rows[0]||null}); } catch(err){res.status(500).json({success:false,message:"Announcement update failed.",error:err.message});}
+});
+app.delete("/admin/announcements/:id", requireAdmin, async (req,res)=>{ try { await pool.query("DELETE FROM announcements WHERE id=$1", [req.params.id]); await writeAdminLog("delete_announcement", {id:req.params.id}, req.admin); res.json({success:true}); } catch(err){res.status(500).json({success:false,message:"Announcement delete failed.",error:err.message});} });
+
+app.get("/admin/features", requireAdmin, async (req,res)=>{ try { const result=await pool.query("SELECT * FROM feature_toggles ORDER BY key"); res.json({success:true, features:result.rows}); } catch(err){res.status(500).json({success:false,message:"Features failed.",error:err.message});} });
+app.patch("/admin/features/:key", requireAdmin, async (req,res)=>{ try { const founderOnly=["maintenance_mode","indexer"]; if(founderOnly.includes(req.params.key) && req.admin.role!=="founder") return res.status(403).json({success:false,message:"Founder access required for this toggle."}); const result=await pool.query(`INSERT INTO feature_toggles (key,value,description,updated_by) VALUES ($1,$2,$3,$4) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, description=COALESCE(EXCLUDED.description, feature_toggles.description), updated_by=EXCLUDED.updated_by, updated_at=NOW() RETURNING *`, [req.params.key, !!req.body.value, req.body.description || null, req.admin.email]); await writeAdminLog("update_feature_toggle", {key:req.params.key, value:!!req.body.value}, req.admin); res.json({success:true, feature:result.rows[0]}); } catch(err){res.status(500).json({success:false,message:"Feature update failed.",error:err.message});} });
+
+app.get("/admin/tool-analytics", requireAdmin, async (req,res)=>{ try { const summary=await pool.query("SELECT tool,event,COUNT(*)::int AS count, MAX(created_at) AS last_used FROM tool_analytics GROUP BY tool,event ORDER BY count DESC LIMIT 100"); const recent=await pool.query("SELECT * FROM tool_analytics ORDER BY created_at DESC LIMIT 50"); res.json({success:true, summary:summary.rows, recent:recent.rows}); } catch(err){res.status(500).json({success:false,message:"Tool analytics failed.",error:err.message});} });
+
+app.get("/admin/search-logs", requireAdmin, async (req,res)=>{ try { const result=await pool.query("SELECT * FROM search_logs ORDER BY created_at DESC LIMIT 100"); res.json({success:true, logs:result.rows}); } catch(err){res.status(500).json({success:false,message:"Search logs failed.",error:err.message});} });
+app.get("/admin/audit-logs", requireAdmin, async (req,res)=>{ try { const result=await pool.query("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 100"); const admin=await pool.query("SELECT * FROM admin_logs ORDER BY created_at DESC LIMIT 100"); res.json({success:true, logs:result.rows, adminLogs:admin.rows}); } catch(err){res.status(500).json({success:false,message:"Audit logs failed.",error:err.message});} });
+app.get("/admin/broken-links", requireAdmin, async (req,res)=>{ try { const result=await pool.query("SELECT * FROM audit_logs WHERE action='broken_link_report' ORDER BY created_at DESC LIMIT 100"); res.json({success:true, reports:result.rows}); } catch(err){res.status(500).json({success:false,message:"Broken links failed.",error:err.message});} });
+
+app.get("/admin/site-settings", requireAdmin, requireFounder, async (req,res)=>{ try { const result=await pool.query("SELECT * FROM site_settings ORDER BY key"); res.json({success:true, settings:result.rows}); } catch(err){res.status(500).json({success:false,message:"Settings failed.",error:err.message});} });
+app.put("/admin/site-settings/:key", requireAdmin, requireFounder, async (req,res)=>{ try { const result=await pool.query(`INSERT INTO site_settings (key,value,updated_by) VALUES ($1,$2,$3) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_by=EXCLUDED.updated_by, updated_at=NOW() RETURNING *`, [req.params.key, req.body.value || {}, req.admin.email]); await writeAdminLog("update_site_setting", {key:req.params.key}, req.admin); res.json({success:true, setting:result.rows[0]}); } catch(err){res.status(500).json({success:false,message:"Setting update failed.",error:err.message});} });
+
+// ===== SIMPLE USER AUTH =====
+app.post("/auth/register", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const username = String(req.body.username || "").trim() || email;
+  const password = String(req.body.password || "");
+  if (!email || !password) return res.status(400).json({ success:false, message:"Email and password are required." });
+  try {
+    const result = await pool.query(
+      `INSERT INTO users (email, username, password_hash, role) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (email) DO NOTHING RETURNING id,email,username,role,is_banned,created_at,last_login_at`,
+      [email, username, hashPassword(password), isFounderEmail(email) ? 'founder' : 'user']
+    );
+    if (!result.rows.length) return res.status(409).json({ success:false, message:"Account already exists." });
+    const user = result.rows[0];
+    const token = crypto.randomBytes(32).toString("hex");
+    res.status(201).json({ success:true, token, user });
+  } catch (err) { res.status(500).json({ success:false, message:"Registration failed.", error:err.message }); }
+});
+
+app.post("/auth/login", async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const password = String(req.body.password || "");
+  try {
+    const result = await pool.query("SELECT id,email,username,role,is_banned,password_hash,created_at,last_login_at FROM users WHERE lower(email)=lower($1) LIMIT 1", [email]);
+    const user = result.rows[0];
+    if (!user || user.is_banned || user.password_hash !== hashPassword(password)) return res.status(401).json({ success:false, message:"Invalid login." });
+    await pool.query("UPDATE users SET last_login_at=NOW() WHERE id=$1", [user.id]);
+    delete user.password_hash;
+    const token = crypto.randomBytes(32).toString("hex");
+    res.json({ success:true, token, user });
+  } catch (err) { res.status(500).json({ success:false, message:"Login failed.", error:err.message }); }
 });
 
 app.post("/auth/logout", (req, res) => {
