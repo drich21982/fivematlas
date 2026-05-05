@@ -6,8 +6,10 @@ module.exports = function (pool, requireAdmin) {
   async function ensureAssetsRouteSchema() {
     await pool.query(`ALTER TABLE trusted_sources ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT false;`);
     await pool.query(`ALTER TABLE indexed_assets ADD COLUMN IF NOT EXISTS department TEXT DEFAULT 'na';`);
+    await pool.query(`ALTER TABLE indexed_assets ADD COLUMN IF NOT EXISTS clicks INTEGER DEFAULT 0;`);
     await pool.query(`ALTER TABLE assets ADD COLUMN IF NOT EXISTS image_url TEXT;`);
     await pool.query(`ALTER TABLE assets ADD COLUMN IF NOT EXISTS department TEXT DEFAULT 'na';`);
+    await pool.query(`ALTER TABLE assets ADD COLUMN IF NOT EXISTS clicks INTEGER DEFAULT 0;`);
   }
 
   function normalizeSource(source = "") {
@@ -35,6 +37,7 @@ module.exports = function (pool, requireAdmin) {
           ia.source_name,
           ia.source_domain,
           ia.department,
+          COALESCE(ia.clicks, 0) AS clicks,
           COALESCE(ts.is_verified, false) AS is_verified,
           ia.indexed_at AS created_at
         FROM indexed_assets ia
@@ -57,6 +60,7 @@ module.exports = function (pool, requireAdmin) {
           developer AS source_name,
           NULL AS source_domain,
           department,
+          COALESCE(clicks, 0) AS clicks,
           COALESCE(verified, false) AS is_verified,
           created_at
         FROM assets
