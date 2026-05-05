@@ -121,6 +121,32 @@ async function ensureFavoritesSchema() {
   `);
 }
 
+
+async function ensureCollectionsSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS collections (
+      id SERIAL PRIMARY KEY,
+      token_hash TEXT NOT NULL,
+      name TEXT NOT NULL,
+      description TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS collection_items (
+      id SERIAL PRIMARY KEY,
+      collection_id INTEGER REFERENCES collections(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL,
+      asset_source TEXT,
+      asset_id TEXT,
+      title TEXT,
+      url TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+}
+
 function cleanDomain(input = "") {
   return String(input)
     .replace(/^https?:\/\//, "")
@@ -1549,6 +1575,43 @@ app.get("/me", requireUserToken, (req, res) => {
       name: "Atlas User"
     }
   });
+});
+
+
+// ===== COLLECTIONS ROUTES =====
+app.get("/collections", requireUserToken, async (req, res) => {
+  try {
+    await ensureCollectionsSchema();
+    const collections = await pool.query(
+      "SELECT id, name, description, created_at FROM collections WHERE token_hash = $1 ORDER BY created_at DESC",
+      [req.userTokenHash]
+    );
+    const items = await pool.query(
+      "SELECT id, collection_id, asset_source, asset_id, title, url, created_at FROM collection_items WHERE token_hash = $1 ORDER BY created_at DESC",
+      [req.userTokenHash]
+    );
+    res.json({ success: true, collections: collections.rows, items: items.rows });
+  } catch (err) {
+    console.error("Collections load error:", err);
+    res.status(500).json({ success: false, message: "Failed to load collections.", error: err.message });
+  }
+});
+
+app.post("/collections", requireUserToken, async (req, res) => {
+  try {
+    await ensureCollectionsSchema();
+    const name = String(req.body.name || "").trim();
+    const description = String(req.body.description || "").trim();
+    if (!name) return res.status(400).json({ success: false, message: "Collection name is required." });
+    const result = await pool.query(
+      "INSERT INTO collections (token_hash, name, description) VALUES ($1, $2, $3) RETURNING id, name, description, created_at",
+      [req.userTokenHash, name, description || null]
+    );
+    res.json({ success: true, collection: result.rows[0] });
+  } catch (err) {
+    console.error("Collection create error:", err);
+    res.status(500).json({ success: false, message: "Failed to create collection.", error: err.message });
+  }
 });
 
 // ===== FAVORITES ROUTES =====
