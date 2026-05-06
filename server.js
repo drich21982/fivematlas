@@ -122,6 +122,48 @@ async function ensureFavoritesSchema() {
 }
 
 
+
+
+async function ensurePhaseTwoSchema() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS project_templates (
+    id SERIAL PRIMARY KEY,
+    token_hash TEXT,
+    title TEXT NOT NULL,
+    category TEXT,
+    description TEXT,
+    payload JSONB DEFAULT '{}'::jsonb,
+    visibility TEXT DEFAULT 'private',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+  );`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS user_activity (
+    id SERIAL PRIMARY KEY,
+    token_hash TEXT,
+    event TEXT NOT NULL,
+    tool TEXT,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW()
+  );`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS user_notifications (
+    id SERIAL PRIMARY KEY,
+    token_hash TEXT,
+    title TEXT NOT NULL,
+    message TEXT,
+    type TEXT DEFAULT 'info',
+    is_read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT NOW()
+  );`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS growth_requests (
+    id SERIAL PRIMARY KEY,
+    token_hash TEXT,
+    kind TEXT NOT NULL,
+    email TEXT,
+    notes TEXT,
+    status TEXT DEFAULT 'new',
+    created_at TIMESTAMP DEFAULT NOW()
+  );`);
+}
+
 async function ensureCollectionsSchema() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS collections (
@@ -1613,6 +1655,55 @@ app.post("/collections", requireUserToken, async (req, res) => {
     res.status(500).json({ success: false, message: "Failed to create collection.", error: err.message });
   }
 });
+
+
+
+// ===== PHASE 2 PLATFORM / RETENTION ROUTES =====
+app.get("/api/dashboard", requireUserToken, async (req, res) => {
+  try {
+    await ensurePhaseTwoSchema();
+    const [templates, activity, notifications, favorites] = await Promise.all([
+      pool.query("SELECT id,title,category,description,visibility,created_at,updated_at FROM project_templates WHERE token_hash=$1 OR visibility='public' ORDER BY updated_at DESC LIMIT 20", [req.userTokenHash]),
+      pool.query("SELECT event,tool,metadata,created_at FROM user_activity WHERE token_hash=$1 ORDER BY created_at DESC LIMIT 50", [req.userTokenHash]),
+      pool.query("SELECT id,title,message,type,is_read,created_at FROM user_notifications WHERE token_hash=$1 OR token_hash IS NULL ORDER BY created_at DESC LIMIT 20", [req.userTokenHash]),
+      pool.query("SELECT COUNT(*)::int AS count FROM favorites WHERE token_hash=$1", [req.userTokenHash])
+    ]);
+    res.json({ success:true, templates:templates.rows, activity:activity.rows, notifications:notifications.rows, favoritesCount:favorites.rows[0]?.count || 0 });
+  } catch (err) { res.status(500).json({ success:false, message:"Dashboard failed.", error:err.message }); }
+});
+
+app.post("/api/user/activity", requireUserToken, async (req,res)=>{
+  try { await ensurePhaseTwoSchema(); const b=req.body||{}; await pool.query("INSERT INTO user_activity (token_hash,event,tool,metadata) VALUES ($1,$2,$3,$4)", [req.userTokenHash, b.event||'activity', b.tool||null, b.metadata||{}]); res.json({success:true}); } catch(err){res.status(500).json({success:false,message:"Activity save failed.",error:err.message});}
+});
+
+app.get("/api/notifications", requireUserToken, async (req,res)=>{
+  try { await ensurePhaseTwoSchema(); const r=await pool.query("SELECT id,title,message,type,is_read,created_at FROM user_notifications WHERE token_hash=$1 OR token_hash IS NULL ORDER BY created_at DESC LIMIT 50", [req.userTokenHash]); res.json({success:true, notifications:r.rows}); } catch(err){res.status(500).json({success:false,message:"Notifications failed.",error:err.message});}
+});
+app.post("/api/notifications", requireUserToken, async (req,res)=>{
+  try { await ensurePhaseTwoSchema(); const b=req.body||{}; const r=await pool.query("INSERT INTO user_notifications (token_hash,title,message,type) VALUES ($1,$2,$3,$4) RETURNING *", [req.userTokenHash,b.title||'Atlas Notification',b.message||'',b.type||'info']); res.json({success:true, notification:r.rows[0]}); } catch(err){res.status(500).json({success:false,message:"Notification create failed.",error:err.message});}
+});
+app.patch("/api/notifications/:id/read", requireUserToken, async (req,res)=>{
+  try { await ensurePhaseTwoSchema(); await pool.query("UPDATE user_notifications SET is_read=TRUE WHERE id=$1 AND (token_hash=$2 OR token_hash IS NULL)", [req.params.id, req.userTokenHash]); res.json({success:true}); } catch(err){res.status(500).json({success:false,message:"Notification update failed.",error:err.message});}
+});
+
+app.get("/api/templates", requireUserToken, async (req,res)=>{
+  try { await ensurePhaseTwoSchema(); const r=await pool.query("SELECT * FROM project_templates WHERE token_hash=$1 OR visibility='public' ORDER BY updated_at DESC LIMIT 100", [req.userTokenHash]); res.json({success:true, templates:r.rows}); } catch(err){res.status(500).json({success:false,message:"Templates failed.",error:err.message});}
+});
+app.post("/api/templates", requireUserToken, async (req,res)=>{
+  try { await ensurePhaseTwoSchema(); const b=req.body||{}; const r=await pool.query("INSERT INTO project_templates (token_hash,title,category,description,payload,visibility) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *", [req.userTokenHash,b.title||'Untitled Template',b.category||'General',b.description||'',b.payload||{},b.visibility||'private']); res.json({success:true, template:r.rows[0]}); } catch(err){res.status(500).json({success:false,message:"Template create failed.",error:err.message});}
+});
+
+app.get("/api/subscriptions/plans", (req,res)=>{
+  res.json({success:true, plans:[
+    {key:'verified_developer', name:'Verified Developer', benefits:['Verified badge','Boosted trust','Portfolio analytics']},
+    {key:'premium_tools', name:'Premium Tool Pack', benefits:['Advanced generators','More exports','Priority templates']},
+    {key:'marketplace_boost', name:'Marketplace Promotion', benefits:['Featured placement','Higher visibility','Campaign analytics']}
+  ]});
+});
+app.post("/api/growth-requests", requireUserToken, async (req,res)=>{
+  try { await ensurePhaseTwoSchema(); const b=req.body||{}; const r=await pool.query("INSERT INTO growth_requests (token_hash,kind,email,notes) VALUES ($1,$2,$3,$4) RETURNING *", [req.userTokenHash,b.kind||'general',normalizeEmail(b.email||''),b.notes||'']); res.json({success:true, request:r.rows[0]}); } catch(err){res.status(500).json({success:false,message:"Growth request failed.",error:err.message});}
+});
+app.post("/api/subscriptions/interest", requireUserToken, async (req,res)=>{ try { await ensurePhaseTwoSchema(); const b=req.body||{}; const r=await pool.query("INSERT INTO growth_requests (token_hash,kind,email,notes) VALUES ($1,$2,$3,$4) RETURNING *", [req.userTokenHash,b.kind||'subscription_interest',normalizeEmail(b.email||''),b.notes||'']); res.json({success:true, request:r.rows[0]}); } catch(err){res.status(500).json({success:false,message:"Subscription interest failed.",error:err.message});} });
 
 // ===== FAVORITES ROUTES =====
 app.get("/favorites", requireUserToken, async (req, res) => {
