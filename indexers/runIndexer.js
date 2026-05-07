@@ -106,122 +106,13 @@ async function fetchJson(url) {
   return response.json();
 }
 
-function getArcticJsonUrl(baseUrl = "") {
-  const lower = String(baseUrl || "").toLowerCase();
-
-  if (lower.includes("catalog.arcticdevlabs.com")) {
-    return "https://catalog.arcticdevlabs.com/assets/products/vehicles.json";
-  }
-
-  return "https://arcticdevlabs.com/assets/products/vehicles.json";
-}
-
-function pickArcticVariantValue(value, preferred = "Bundle") {
-  if (value == null) return null;
-  if (typeof value !== "object" || Array.isArray(value)) return value;
-  if (Object.prototype.hasOwnProperty.call(value, preferred)) return value[preferred];
-  const firstKey = Object.keys(value)[0];
-  return firstKey ? value[firstKey] : null;
-}
-
-function pickArcticImage(vehicle = {}) {
-  if (vehicle.pack === true && vehicle.images && !Array.isArray(vehicle.images)) {
-    const bundleImages = vehicle.images.Bundle;
-    if (Array.isArray(bundleImages) && bundleImages.length) return bundleImages[0];
-
-    for (const images of Object.values(vehicle.images)) {
-      if (Array.isArray(images) && images.length) return images[0];
-    }
-  }
-
-  if (Array.isArray(vehicle.images) && vehicle.images.length) {
-    return vehicle.images[0];
-  }
-
-  return null;
-}
-
-function normalizeArcticTags(vehicle = {}, title = "", description = "") {
-  const rawTags = Array.isArray(vehicle.tags) ? vehicle.tags : [];
-  const guessed = guessTags(`${title} ${description} ${rawTags.join(" ")}`);
-  const tags = [...rawTags.map(cleanText).filter(Boolean), ...guessed, "vehicle"];
-  if (vehicle.pack === true) tags.push("pack");
-  return [...new Set(tags.map(tag => String(tag).trim()).filter(Boolean))];
-}
-
-async function crawlArcticJson(source, baseUrl, limit = 250) {
-  const jsonUrl = getArcticJsonUrl(baseUrl);
-  const products = [];
-  const productErrors = [];
-
-  let data;
-  try {
-    data = await fetchJson(jsonUrl);
-  } catch (err) {
-    return {
-      pagesCrawled: [jsonUrl],
-      linksFound: 0,
-      products: [],
-      pageErrors: [{ url: jsonUrl, error: err.message }],
-      productErrors: []
-    };
-  }
-
-  for (const [slug, vehicle] of Object.entries(data || {})) {
-    try {
-      if (!vehicle || typeof vehicle !== "object") continue;
-
-      const title = cleanText(vehicle.name || slug);
-      const description = cleanText(pickArcticVariantValue(vehicle.description) || "");
-      const rawPrice = pickArcticVariantValue(vehicle.price);
-      const price = rawPrice == null || rawPrice === "" ? null : String(rawPrice);
-      const imageUrl = pickArcticImage(vehicle);
-      const url = `https://arcticdevlabs.com/store/vehicle?vehicle=${encodeURIComponent(slug)}`;
-      const tags = normalizeArcticTags(vehicle, title, description);
-
-      if (!title || !url) continue;
-
-      products.push({
-        source_id: source.id,
-        source_name: source.name || "Arctic Development",
-        source_domain: source.domain || "arcticdevlabs.com",
-        title,
-        url,
-        description,
-        category: vehicle.pack === true ? "pack" : "vehicle",
-        price,
-        image_url: imageUrl,
-        tags
-      });
-
-      if (products.length >= Number(limit)) break;
-    } catch (err) {
-      productErrors.push({
-        url: `https://arcticdevlabs.com/store/vehicle?vehicle=${slug}`,
-        error: err.message
-      });
-    }
-  }
-
-  return {
-    pagesCrawled: [jsonUrl],
-    linksFound: products.length,
-    products,
-    pageErrors: [],
-    productErrors
-  };
-}
-
 function detectPlatform(html = "", url = "") {
-  const lowerHtml = String(html || "").toLowerCase();
-  const lowerUrl = String(url || "").toLowerCase();
+  const lowerHtml = String(html).toLowerCase();
+  const lowerUrl = String(url).toLowerCase();
 
-  // Arctic Development is a custom JS-rendered store. Do NOT use the generic crawler.
-  // The product data is loaded from /assets/products/vehicles.json.
-  if (
-    lowerUrl.includes("arcticdevlabs.com") ||
-    lowerUrl.includes("catalog.arcticdevlabs.com")
-  ) {
+  // Arctic Development is a custom JS/JSON storefront.
+  // Force this BEFORE generic/shopify/tebex detection or the crawler indexes CSS/JS garbage.
+  if (lowerUrl.includes("arcticdevlabs.com")) {
     return "arctic-json";
   }
 
@@ -551,6 +442,188 @@ async function crawlShopify(source, baseUrl, limit = 250) {
 
 async function crawlTebex(source, baseUrl, limit = 250) {
   return crawlGeneric(source, baseUrl, limit);
+}
+
+
+const ARCTIC_PRODUCT_FEEDS = [
+  {
+    key: "vehicles",
+    category: "Vehicles",
+    assetType: "vehicle",
+    productParam: "vehicle",
+    productPath: "/store/vehicle",
+    urls: [
+      "https://arcticdevlabs.com/assets/products/vehicles.json",
+      "https://arcticdevlabs.com/store/assets/products/vehicles.json"
+    ]
+  },
+  {
+    key: "eup",
+    category: "EUP",
+    assetType: "eup",
+    productParam: "eup",
+    productPath: "/store/eup",
+    urls: [
+      "https://arcticdevlabs.com/assets/products/eup.json",
+      "https://arcticdevlabs.com/store/assets/products/eup.json"
+    ]
+  },
+  {
+    key: "scripts",
+    category: "Scripts",
+    assetType: "script",
+    productParam: "script",
+    productPath: "/store/script",
+    urls: [
+      "https://arcticdevlabs.com/assets/products/scripts.json",
+      "https://arcticdevlabs.com/assets/products/script.json",
+      "https://arcticdevlabs.com/store/assets/products/scripts.json",
+      "https://arcticdevlabs.com/store/assets/products/script.json"
+    ]
+  }
+];
+
+function firstValueFromObject(value, preferredKeys = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+
+  for (const key of preferredKeys) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      return value[key];
+    }
+  }
+
+  const values = Object.values(value);
+  return values.length ? values[0] : null;
+}
+
+function pickArcticDescription(item = {}, feed = {}) {
+  if (typeof item.description === "string") return cleanText(item.description);
+
+  const preferred = feed.assetType === "eup" ? ["All", "Bundle"] : ["Bundle", "All"];
+  const value = firstValueFromObject(item.description, preferred);
+  return cleanText(value || "");
+}
+
+function pickArcticPrice(item = {}, feed = {}) {
+  if (typeof item.price === "number") return String(item.price.toFixed(2));
+  if (typeof item.price === "string") return item.price;
+
+  const preferred = feed.assetType === "eup" ? ["All", "Bundle"] : ["Bundle", "All"];
+  const value = firstValueFromObject(item.price, preferred);
+  return value == null ? null : String(value);
+}
+
+function pickArcticImages(item = {}, feed = {}) {
+  if (Array.isArray(item.images)) return item.images.filter(Boolean);
+
+  if (item.images && typeof item.images === "object") {
+    const preferred = feed.assetType === "eup" ? ["All", "Bundle"] : ["Bundle", "All"];
+    const value = firstValueFromObject(item.images, preferred);
+    if (Array.isArray(value)) return value.filter(Boolean);
+  }
+
+  return [];
+}
+
+function buildArcticDescription(item = {}, feed = {}) {
+  const parts = [];
+  const desc = pickArcticDescription(item, feed);
+  if (desc) parts.push(desc);
+
+  if (Array.isArray(item.Included) && item.Included.length) {
+    parts.push(`Included: ${item.Included.map(cleanText).filter(Boolean).join(", ")}`);
+  }
+
+  if (Array.isArray(item.extras) && item.extras.length) {
+    parts.push(`Extras: ${item.extras.map(cleanText).filter(Boolean).join(", ")}`);
+  }
+
+  if (item.docs && typeof item.docs === "string") {
+    parts.push(`Documentation: ${item.docs}`);
+  }
+
+  return parts.join("\n\n").trim();
+}
+
+async function fetchFirstWorkingJson(urls = []) {
+  const errors = [];
+
+  for (const url of urls) {
+    try {
+      const data = await fetchJson(url);
+      return { url, data };
+    } catch (err) {
+      errors.push({ url, error: err.message });
+    }
+  }
+
+  return { url: null, data: null, errors };
+}
+
+function mapArcticProduct(source, feed, slug, item) {
+  const images = pickArcticImages(item, feed);
+  const tags = Array.isArray(item.tags) ? item.tags.filter(Boolean) : [];
+  const description = buildArcticDescription(item, feed);
+  const url = `https://arcticdevlabs.com${feed.productPath}?${feed.productParam}=${encodeURIComponent(slug)}`;
+
+  return {
+    source_id: source.id,
+    source_name: source.name || "Arctic Development",
+    source_domain: source.domain || "arcticdevlabs.com",
+    title: cleanText(item.name || slug),
+    url,
+    description,
+    category: feed.category,
+    price: pickArcticPrice(item, feed),
+    image_url: images[0] || null,
+    tags: [...new Set([...tags, feed.assetType])]
+  };
+}
+
+async function crawlArcticJson(source, baseUrl, limit = 250) {
+  const products = [];
+  const pagesCrawled = [];
+  const pageErrors = [];
+  const productErrors = [];
+
+  for (const feed of ARCTIC_PRODUCT_FEEDS) {
+    const result = await fetchFirstWorkingJson(feed.urls);
+
+    if (!result.data) {
+      pageErrors.push({
+        url: feed.urls[0],
+        error: `Could not fetch ${feed.key} JSON feed. Tried: ${feed.urls.join(", ")}`
+      });
+      continue;
+    }
+
+    pagesCrawled.push(result.url);
+
+    for (const [slug, item] of Object.entries(result.data || {})) {
+      if (products.length >= limit) break;
+
+      try {
+        if (!item || typeof item !== "object") continue;
+        if (!item.name && !item.description && !item.images) continue;
+
+        const product = mapArcticProduct(source, feed, slug, item);
+        if (product.title && product.url) products.push(product);
+      } catch (err) {
+        productErrors.push({
+          url: `arctic:${feed.key}:${slug}`,
+          error: err.message
+        });
+      }
+    }
+  }
+
+  return {
+    pagesCrawled,
+    linksFound: products.length,
+    products,
+    pageErrors,
+    productErrors
+  };
 }
 
 async function saveProducts(pool, products = []) {
