@@ -1,4 +1,5 @@
 const cheerio = require("cheerio");
+const { runArcticCustomIndexer } = require("./arcticCustomIndexer");
 
 function cleanText(value = "") {
   return String(value)
@@ -109,6 +110,14 @@ async function fetchJson(url) {
 function detectPlatform(html = "", url = "") {
   const lowerHtml = String(html).toLowerCase();
   const lowerUrl = String(url).toLowerCase();
+
+  if (
+    lowerUrl.includes("arcticdevlabs.com") ||
+    lowerHtml.includes("catalog.arcticdevlabs.com") ||
+    lowerHtml.includes("arctic development")
+  ) {
+    return "arctic-custom";
+  }
 
   if (
     lowerUrl.includes("tebex.io") ||
@@ -527,7 +536,14 @@ async function runIndexer(pool, options = {}) {
 
   let crawlResult;
 
-  if (platform === "shopify") {
+  if (platform === "arctic-custom") {
+    crawlResult = await runArcticCustomIndexer({
+      source,
+      baseUrl,
+      fetchHtml,
+      limit
+    });
+  } else if (platform === "shopify") {
     crawlResult = await crawlShopify(source, baseUrl, limit);
   } else if (platform === "tebex") {
     crawlResult = await crawlTebex(source, baseUrl, limit);
