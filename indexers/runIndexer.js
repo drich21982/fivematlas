@@ -1,5 +1,4 @@
 const cheerio = require("cheerio");
-const { runArcticCustomIndexer } = require("./arcticCustomIndexer");
 
 function cleanText(value = "") {
   return String(value)
@@ -113,10 +112,11 @@ function detectPlatform(html = "", url = "") {
 
   if (
     lowerUrl.includes("arcticdevlabs.com") ||
+    lowerUrl.includes("catalog.arcticdevlabs.com") ||
     lowerHtml.includes("catalog.arcticdevlabs.com") ||
     lowerHtml.includes("arctic development")
   ) {
-    return "arctic-custom";
+    return "arctic_custom";
   }
 
   if (
@@ -313,6 +313,249 @@ function parseProductPage(html, productUrl, source) {
     price: price ? String(price) : null,
     image_url: imageUrl,
     tags
+  };
+}
+
+
+function htmlDecode(value = "") {
+  return String(value || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function isJunkArcticTitle(title = "") {
+  const value = cleanText(title).toLowerCase();
+  if (!value || value.length < 4) return true;
+  const badExact = new Set([
+    "our store",
+    "vehicle catalog",
+    "arctic development",
+    "established 2024",
+    "quick links",
+    "contact us",
+    "legal stuff",
+    "vehicles",
+    "vehicle",
+    "scripts",
+    "graphics",
+    "leo",
+    "fire",
+    "civilian",
+    "lore friendly",
+    "generic lore",
+    "all brands",
+    "all gta base models",
+    "30-80k polys"
+  ]);
+  if (badExact.has(value)) return true;
+  if (/^(home|store|team|discord|youtube|tiktok|documentation)$/i.test(value)) return true;
+  return false;
+}
+
+function looksLikeArcticAssetTitle(title = "") {
+  const t = cleanText(title);
+  if (isJunkArcticTitle(t)) return false;
+  const lower = t.toLowerCase();
+
+  if (/\b(19|20)\d{2}\b/.test(t)) return true;
+  if (/\b(leo|fire|ems|police|sheriff|generic|lore|fivem|ready|addon|pack|vehicle|truck|charger|tahoe|explorer|crown vic|cvpi|corvette|durango|ram|ford|chevy|dodge|gmc|bmw|audi|toyota|nissan|cadillac|mustang|camaro)\b/i.test(t)) return true;
+  if (lower.includes(" | ") && t.length > 8) return true;
+
+  return false;
+}
+
+function extractFromJsObjectWindow(windowText = "") {
+  const obj = {};
+
+  const get = (keys) => {
+    const quoteClass = "[\"'`]";
+    const valueClass = "([^\"'`]{2,180})";
+
+    for (const key of keys) {
+      const patterns = [
+        new RegExp(key + "\\s*:\\s*" + quoteClass + valueClass + quoteClass, "i"),
+        new RegExp("[\"']" + key + "[\"']\\s*:\\s*" + quoteClass + valueClass + quoteClass, "i")
+      ];
+      for (const pattern of patterns) {
+        const match = windowText.match(pattern);
+        if (match?.[1]) return htmlDecode(cleanText(match[1]));
+      }
+    }
+    return null;
+  };
+
+  obj.title = get(["title", "name", "label", "displayName", "vehicleName"]);
+  obj.description = get(["description", "desc", "summary", "shortDescription"]);
+  obj.brand = get(["brand", "make", "manufacturer"]);
+  obj.model = get(["model"]);
+  obj.type = get(["type", "category", "vehicleType"]);
+  obj.price = get(["price", "cost"]);
+  obj.url = get(["url", "href", "link", "storeUrl", "productUrl"]);
+  obj.image_url = get(["image", "imageUrl", "img", "src", "thumbnail", "thumbnailUrl", "photo"]);
+
+  return obj;
+}
+
+function collectArcticProductsFromText(text = "", source, catalogBase, productsByKey) {
+  const input = String(text || "");
+
+  // Parse JS/JSON-ish object windows that contain title/name style fields.
+  const keyRegex = /(?:[\"']?(?:title|name|displayName|vehicleName)[\"']?\s*:\s*[\"'`][^\"'`]{3,180}[\"'`])/gi;
+  let match;
+  while ((match = keyRegex.exec(input))) {
+    const start = Math.max(0, match.index - 600);
+    const end = Math.min(input.length, match.index + 1800);
+    const windowText = input.slice(start, end);
+    const obj = extractFromJsObjectWindow(windowText);
+
+    let title = obj.title;
+    if (!title && obj.brand && obj.model) title = `${obj.brand} ${obj.model}`;
+    if (!looksLikeArcticAssetTitle(title)) continue;
+
+    const url = obj.url && /^https?:\/\//i.test(obj.url)
+      ? obj.url
+      : `${catalogBase}/?search=${encodeURIComponent(title)}`;
+
+    const imageUrl = obj.image_url
+      ? normalizeUrl(obj.image_url, catalogBase)
+      : null;
+
+    const descriptionParts = [obj.description, obj.brand, obj.model, obj.type].filter(Boolean);
+    const description = cleanText(descriptionParts.join(" · ")) || "Arctic Development vehicle catalog asset.";
+    const tags = guessTags(`${title} ${description} ${url}`);
+
+    productsByKey.set(title.toLowerCase(), {
+      source_id: source.id,
+      source_name: source.name,
+      source_domain: source.domain,
+      title,
+      url,
+      description,
+      category: tags[0] || "vehicle",
+      price: obj.price || null,
+      image_url: imageUrl,
+      tags: [...new Set(["vehicle", ...tags])]
+    });
+  }
+
+  // Fallback: pull quoted strings that look like actual vehicle/product names.
+  const stringRegex = /[\"'`]([^\"'`]{4,140})[\"'`]/g;
+  while ((match = stringRegex.exec(input))) {
+    const title = htmlDecode(cleanText(match[1]));
+    if (!looksLikeArcticAssetTitle(title)) continue;
+    const key = title.toLowerCase();
+    if (productsByKey.has(key)) continue;
+    const tags = guessTags(title);
+    productsByKey.set(key, {
+      source_id: source.id,
+      source_name: source.name,
+      source_domain: source.domain,
+      title,
+      url: `${catalogBase}/?search=${encodeURIComponent(title)}`,
+      description: "Arctic Development vehicle catalog asset.",
+      category: tags[0] || "vehicle",
+      price: null,
+      image_url: null,
+      tags: [...new Set(["vehicle", ...tags])]
+    });
+  }
+}
+
+function extractScriptUrls(html, pageUrl) {
+  const $ = cheerio.load(html);
+  const urls = new Set();
+  $("script[src]").each((_, el) => {
+    const src = $(el).attr("src");
+    const full = normalizeUrl(src, pageUrl);
+    if (full) urls.add(full);
+  });
+  $("link[href]").each((_, el) => {
+    const href = $(el).attr("href");
+    if (!href || !/\.js(?:\?|$)/i.test(href)) return;
+    const full = normalizeUrl(href, pageUrl);
+    if (full) urls.add(full);
+  });
+  return [...urls];
+}
+
+async function fetchTextLoose(url) {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "FiveMAtlasIndexer/1.0 (+https://fivematlas.com)",
+      Accept: "text/html,application/javascript,text/javascript,application/json,text/plain,*/*"
+    }
+  });
+  if (!response.ok) throw new Error(`Fetch failed with status ${response.status}`);
+  return response.text();
+}
+
+async function crawlArcticCustom(source, baseUrl, limit = 250) {
+  const catalogBase = "https://catalog.arcticdevlabs.com";
+  const pagesCrawled = [];
+  const pageErrors = [];
+  const productErrors = [];
+  const productsByKey = new Map();
+  const crawledTexts = new Set();
+
+  const seedUrls = [
+    baseUrl,
+    catalogBase,
+    `${catalogBase}/`,
+    `${catalogBase}/index.html`,
+    `${catalogBase}/manifest.json`,
+    `${catalogBase}/asset-manifest.json`,
+    `${catalogBase}/data.json`,
+    `${catalogBase}/vehicles.json`,
+    `${catalogBase}/catalog.json`,
+    `${catalogBase}/api/vehicles`,
+    `${catalogBase}/api/catalog`,
+    `${catalogBase}/api/products`
+  ];
+
+  const scriptUrls = new Set();
+
+  for (const url of seedUrls) {
+    if (crawledTexts.has(url)) continue;
+    crawledTexts.add(url);
+    try {
+      const text = await fetchTextLoose(url);
+      pagesCrawled.push(url);
+      collectArcticProductsFromText(text, source, catalogBase, productsByKey);
+      for (const scriptUrl of extractScriptUrls(text, url)) scriptUrls.add(scriptUrl);
+
+      // Some static apps expose bundled JS filenames inside manifests.
+      const bundleMatches = text.match(/(?:static\/js\/|assets\/)[A-Za-z0-9._/-]+\.js/g) || [];
+      for (const bundle of bundleMatches) scriptUrls.add(normalizeUrl(bundle, catalogBase));
+    } catch (err) {
+      pageErrors.push({ url, error: err.message });
+    }
+  }
+
+  for (const scriptUrl of [...scriptUrls].filter(Boolean).slice(0, 40)) {
+    if (crawledTexts.has(scriptUrl)) continue;
+    crawledTexts.add(scriptUrl);
+    try {
+      const text = await fetchTextLoose(scriptUrl);
+      pagesCrawled.push(scriptUrl);
+      collectArcticProductsFromText(text, source, catalogBase, productsByKey);
+    } catch (err) {
+      pageErrors.push({ url: scriptUrl, error: err.message });
+    }
+  }
+
+  const products = [...productsByKey.values()]
+    .filter(product => looksLikeArcticAssetTitle(product.title))
+    .slice(0, Number(limit));
+
+  return {
+    pagesCrawled,
+    linksFound: products.length,
+    products,
+    pageErrors,
+    productErrors
   };
 }
 
@@ -536,13 +779,8 @@ async function runIndexer(pool, options = {}) {
 
   let crawlResult;
 
-  if (platform === "arctic-custom") {
-    crawlResult = await runArcticCustomIndexer({
-      source,
-      baseUrl,
-      fetchHtml,
-      limit
-    });
+  if (platform === "arctic_custom") {
+    crawlResult = await crawlArcticCustom(source, baseUrl, limit);
   } else if (platform === "shopify") {
     crawlResult = await crawlShopify(source, baseUrl, limit);
   } else if (platform === "tebex") {
