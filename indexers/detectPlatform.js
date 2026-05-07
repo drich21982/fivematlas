@@ -2,11 +2,9 @@ async function detectPlatform({ html = "", url = "" }) {
   const lowerHtml = String(html || "").toLowerCase();
   const lowerUrl = String(url || "").toLowerCase();
 
-  // Arctic Development is a custom JS-rendered store. Do NOT send it to generic.
-  if (
-    lowerUrl.includes("arcticdevlabs.com") ||
-    lowerUrl.includes("catalog.arcticdevlabs.com")
-  ) {
+  // Arctic Development is a custom JS/JSON storefront.
+  // Always route it to the JSON importer before generic detection.
+  if (lowerUrl.includes("arcticdevlabs.com")) {
     return "arctic-json";
   }
 
