@@ -3,6 +3,14 @@ async function detectPlatform({ html = "", url = "" }) {
   const lowerUrl = String(url || "").toLowerCase();
 
   if (
+    lowerUrl.includes("arcticdevlabs.com") ||
+    lowerHtml.includes("catalog.arcticdevlabs.com") ||
+    lowerHtml.includes("arctic development")
+  ) {
+    return "arctic-custom";
+  }
+
+  if (
     lowerUrl.includes("tebex.io") ||
     lowerHtml.includes("tebex") ||
     lowerHtml.includes("buycraft") ||
