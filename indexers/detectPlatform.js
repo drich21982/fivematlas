@@ -4,10 +4,11 @@ async function detectPlatform({ html = "", url = "" }) {
 
   if (
     lowerUrl.includes("arcticdevlabs.com") ||
+    lowerUrl.includes("catalog.arcticdevlabs.com") ||
     lowerHtml.includes("catalog.arcticdevlabs.com") ||
     lowerHtml.includes("arctic development")
   ) {
-    return "arctic-custom";
+    return "arctic_custom";
   }
 
   if (
