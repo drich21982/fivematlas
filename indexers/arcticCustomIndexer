@@ -1,0 +1,314 @@
+const cheerio = require("cheerio");
+const {
+  parseProductPage,
+  cleanText,
+  normalizeUrl,
+  stripUrlNoise,
+  guessTags
+} = require("./genericIndexer");
+
+function slugify(value = "") {
+  return String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 90) || `item-${Date.now()}`;
+}
+
+function uniquePush(map, product) {
+  if (!product || !product.title) return;
+
+  const key = product.url || `${product.title}::${product.source_domain}`;
+  if (!key || map.has(key)) return;
+
+  map.set(key, product);
+}
+
+function normalizeImage(value, baseUrl) {
+  if (!value) return null;
+  if (Array.isArray(value)) value = value[0];
+  if (typeof value === "object") value = value.url || value.src || value.image || value.path;
+  if (!value) return null;
+  return normalizeUrl(String(value), baseUrl);
+}
+
+function extractMoney(value = "") {
+  const text = cleanText(value);
+  const match = text.match(/(?:\$|USD\s*)\s?\d+(?:\.\d{2})?/i);
+  return match ? match[0].replace(/\s+/g, "") : null;
+}
+
+function looksLikeVehicleObject(obj = {}) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+
+  const keys = Object.keys(obj).map(k => k.toLowerCase());
+  const joinedKeys = keys.join(" ");
+  const sample = cleanText(JSON.stringify(obj)).toLowerCase();
+
+  const hasVehicleKey = /vehicle|car|model|brand|make|spawn|poly|base|catalog|trim|year/.test(joinedKeys);
+  const hasName = obj.name || obj.title || obj.label || obj.model || obj.vehicle || obj.brand || obj.make;
+  const hasAssetClue = /vehicle|polys|poly|gta|base model|leo|fire|civilian|lore|non[-\s]?els|els|addon|replace|ford|chevy|dodge|bmw|audi|toyota|honda|cadillac/.test(sample);
+
+  return Boolean(hasName && (hasVehicleKey || hasAssetClue));
+}
+
+function buildTitleFromObject(obj = {}) {
+  const direct = obj.title || obj.name || obj.label || obj.vehicleName || obj.displayName;
+  if (direct) return cleanText(direct);
+
+  const parts = [obj.year, obj.brand || obj.make || obj.manufacturer, obj.model, obj.trim]
+    .filter(Boolean)
+    .map(cleanText);
+
+  return cleanText(parts.join(" "));
+}
+
+function buildDescriptionFromObject(obj = {}) {
+  const direct = obj.description || obj.desc || obj.details || obj.summary || obj.notes;
+  const parts = [];
+
+  if (direct) parts.push(cleanText(direct));
+  if (obj.brand || obj.make) parts.push(`Brand: ${cleanText(obj.brand || obj.make)}`);
+  if (obj.vehicleType || obj.type) parts.push(`Type: ${cleanText(obj.vehicleType || obj.type)}`);
+  if (obj.branding) parts.push(`Branding: ${cleanText(obj.branding)}`);
+  if (obj.polys || obj.polyCount || obj.polycount) parts.push(`Polys: ${cleanText(obj.polys || obj.polyCount || obj.polycount)}`);
+
+  return cleanText(parts.join(" • "));
+}
+
+function productFromObject(obj, source, catalogBaseUrl) {
+  if (!looksLikeVehicleObject(obj)) return null;
+
+  const title = buildTitleFromObject(obj);
+  if (!title || title.length < 2) return null;
+
+  const rawUrl = obj.url || obj.href || obj.link || obj.productUrl || obj.storeUrl || obj.pageUrl;
+  const url = rawUrl
+    ? stripUrlNoise(normalizeUrl(rawUrl, catalogBaseUrl))
+    : `${catalogBaseUrl}/?q=${encodeURIComponent(title)}`;
+
+  const description = buildDescriptionFromObject(obj);
+  const rawPrice = obj.price || obj.amount || obj.cost || obj.salePrice || obj.lowPrice;
+  const price = rawPrice ? String(rawPrice).replace(/^USD\s*/i, "$") : extractMoney(JSON.stringify(obj));
+  const imageUrl = normalizeImage(
+    obj.image || obj.imageUrl || obj.img || obj.thumbnail || obj.thumbnailUrl || obj.cover || obj.photo || obj.src,
+    catalogBaseUrl
+  );
+
+  const tagText = `${title} ${description} ${JSON.stringify(obj)}`;
+  const tags = [...new Set(["vehicle", "catalog", "arctic", ...guessTags(tagText)])];
+
+  return {
+    source_id: source.id,
+    source_name: source.name,
+    source_domain: source.domain,
+    title,
+    url,
+    description,
+    category: "vehicle",
+    price: price ? String(price) : null,
+    image_url: imageUrl,
+    tags
+  };
+}
+
+function walkJsonForProducts(value, source, catalogBaseUrl, products, seen = new WeakSet()) {
+  if (!value || typeof value !== "object") return;
+  if (seen.has(value)) return;
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) walkJsonForProducts(item, source, catalogBaseUrl, products, seen);
+    return;
+  }
+
+  const product = productFromObject(value, source, catalogBaseUrl);
+  if (product) uniquePush(products, product);
+
+  for (const child of Object.values(value)) {
+    if (child && typeof child === "object") {
+      walkJsonForProducts(child, source, catalogBaseUrl, products, seen);
+    }
+  }
+}
+
+function parseJsonScripts(html, source, catalogBaseUrl, products) {
+  const $ = cheerio.load(html);
+
+  $("script").each((_, el) => {
+    const raw = $(el).contents().text();
+    if (!raw || raw.length < 10) return;
+
+    const trimmed = raw.trim();
+
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        walkJsonForProducts(JSON.parse(trimmed), source, catalogBaseUrl, products);
+      } catch {}
+    }
+
+    // Covers Next/Vite bundles where catalog data is assigned inside JS instead of plain JSON.
+    const objectLikeMatches = trimmed.match(/\{[^{}]*(?:vehicle|brand|model|poly|gta|image|title|name)[^{}]*\}/gi) || [];
+    for (const chunk of objectLikeMatches.slice(0, 800)) {
+      try {
+        const loose = chunk
+          .replace(/([{,])\s*([A-Za-z0-9_$-]+)\s*:/g, '$1"$2":')
+          .replace(/'/g, '"')
+          .replace(/,\s*}/g, "}");
+        walkJsonForProducts(JSON.parse(loose), source, catalogBaseUrl, products);
+      } catch {}
+    }
+  });
+}
+
+function parseDomCards(html, pageUrl, source, products) {
+  const $ = cheerio.load(html);
+
+  const selectors = [
+    "article",
+    ".card",
+    "[class*='card']",
+    "[class*='vehicle']",
+    "[class*='product']",
+    "[class*='catalog']"
+  ].join(",");
+
+  $(selectors).each((_, el) => {
+    const node = $(el);
+    const title = cleanText(
+      node.find("h1,h2,h3,h4,[class*='title'],[class*='name']").first().text()
+    );
+
+    const text = cleanText(node.text());
+    if (!title || title.length < 2 || text.length < title.length) return;
+    if (!/vehicle|polys|poly|gta|base|brand|leo|fire|civilian|lore|ford|chevy|dodge|bmw|audi|toyota|honda|cadillac/i.test(text)) return;
+
+    let href = node.find("a[href]").first().attr("href") || node.closest("a[href]").attr("href");
+    const url = href
+      ? stripUrlNoise(normalizeUrl(href, pageUrl))
+      : `${pageUrl.replace(/\/+$/, "")}/?q=${encodeURIComponent(title)}`;
+
+    const img = node.find("img[src],img[data-src]").first();
+    const imageUrl = normalizeUrl(img.attr("src") || img.attr("data-src"), pageUrl);
+    const price = extractMoney(text);
+    const tags = [...new Set(["vehicle", "catalog", "arctic", ...guessTags(text)])];
+
+    uniquePush(products, {
+      source_id: source.id,
+      source_name: source.name,
+      source_domain: source.domain,
+      title,
+      url,
+      description: text.slice(0, 1000),
+      category: "vehicle",
+      price,
+      image_url: imageUrl,
+      tags
+    });
+  });
+}
+
+function extractCandidateLinks(html, pageUrl) {
+  const $ = cheerio.load(html);
+  const links = new Set();
+
+  $("a[href]").each((_, el) => {
+    const href = $(el).attr("href");
+    const fullUrl = href ? normalizeUrl(href, pageUrl) : null;
+    if (!fullUrl) return;
+
+    const lower = fullUrl.toLowerCase();
+    if (
+      lower.includes("login") ||
+      lower.includes("cart") ||
+      lower.includes("checkout") ||
+      lower.includes("discord") ||
+      lower.includes("youtube") ||
+      lower.includes("tiktok") ||
+      lower.includes("privacy") ||
+      lower.includes("terms")
+    ) return;
+
+    if (
+      lower.includes("arcticdevlabs.com") &&
+      (lower.includes("catalog") || lower.includes("store") || lower.includes("vehicle") || lower.includes("product"))
+    ) {
+      links.add(stripUrlNoise(fullUrl));
+    }
+  });
+
+  return [...links];
+}
+
+async function runArcticCustomIndexer({ source, baseUrl, fetchHtml, limit = 250 }) {
+  const products = new Map();
+  const pagesCrawled = [];
+  const pageErrors = [];
+  const productErrors = [];
+  const visited = new Set();
+
+  const normalizedBase = String(baseUrl || "https://arcticdevlabs.com/store").replace(/\/+$/, "");
+  const seeds = [...new Set([
+    normalizedBase,
+    "https://arcticdevlabs.com/store",
+    "https://catalog.arcticdevlabs.com/"
+  ])];
+
+  const queue = seeds.map(url => ({ url, depth: 0 }));
+
+  while (queue.length && visited.size < 40 && products.size < limit) {
+    const current = queue.shift();
+    if (!current?.url || visited.has(current.url)) continue;
+    visited.add(current.url);
+
+    try {
+      const html = await fetchHtml(current.url);
+      pagesCrawled.push(current.url);
+
+      const catalogBase = current.url.includes("catalog.arcticdevlabs.com")
+        ? "https://catalog.arcticdevlabs.com"
+        : "https://catalog.arcticdevlabs.com";
+
+      parseJsonScripts(html, source, catalogBase, products);
+      parseDomCards(html, current.url, source, products);
+
+      for (const link of extractCandidateLinks(html, current.url)) {
+        if (!visited.has(link) && current.depth < 2) {
+          queue.push({ url: link, depth: current.depth + 1 });
+        }
+      }
+    } catch (err) {
+      pageErrors.push({ url: current.url, error: err.message });
+    }
+  }
+
+  // Fallback: if direct catalog data did not expose product objects, parse any discovered product-ish pages.
+  if (products.size < 5) {
+    for (const pageUrl of [...visited].filter(url => /product|vehicle|store|catalog/i.test(url)).slice(0, limit)) {
+      try {
+        const html = await fetchHtml(pageUrl);
+        const product = parseProductPage(html, pageUrl, source);
+        if (product && !/^store\s*[·|-]/i.test(product.title)) {
+          product.category = product.category === "external" ? "vehicle" : product.category;
+          product.tags = [...new Set(["arctic", "catalog", ...(product.tags || [])])];
+          uniquePush(products, product);
+        }
+      } catch (err) {
+        productErrors.push({ url: pageUrl, error: err.message });
+      }
+    }
+  }
+
+  const finalProducts = [...products.values()].slice(0, Number(limit) || 250);
+
+  return {
+    platform: "arctic-custom",
+    pagesCrawled,
+    linksFound: visited.size,
+    products: finalProducts,
+    pageErrors,
+    productErrors
+  };
+}
+
+module.exports = { runArcticCustomIndexer };
